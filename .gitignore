@@ -1,0 +1,7 @@
+premiumvideo.db
+premiumvideo.db-*
+data/
+*.pyc
+__pycache__/
+.env
+venv/
