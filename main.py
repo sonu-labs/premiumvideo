@@ -17,9 +17,10 @@ RUN
   python main.py
 
 TEST WITHOUT A TOKEN
-  python main.py --demo        # the terminal becomes Telegram (drive admin + user accounts)
-  python main.py --selftest    # 89 automated checks of the whole purchase lifecycle
-  python main.py --apitest     # verifies the real HTTP layer against a fake Telegram server
+  python main.py --demo           # the terminal becomes Telegram (drive admin + user accounts)
+  python main.py --selftest       # 102 automated checks of the whole purchase lifecycle (SQLite)
+  python main.py --selftest-mongo # the same 102 checks against the MongoDB backend
+  python main.py --apitest        # verifies the real HTTP layer against a fake Telegram server
 """
 from __future__ import annotations
 
@@ -155,8 +156,28 @@ def t_url(v: str) -> str:
 
 
 # ==========================================================================
-# DATABASE
+# DATABASE — pluggable backends: SQLite (default) or MongoDB (MONGO_URI)
 # ==========================================================================
+#   SQLite  : zero setup — everything lives in premiumvideo.db (classic mode)
+#   MongoDB : export MONGO_URI="mongodb+srv://user:pass@cluster0.xxxx.mongodb.net"
+#             (optionally MONGO_DB=<dbname>, default "premiumvideo")
+#             → all shop data lives in MongoDB (recommended for keeping data
+#             safe: Atlas backups / replicas). Requires:  pip install pymongo
+#   Existing shop on SQLite? Migrate once with:
+#             python main.py --migrate            (copies SQLite → MongoDB)
+#   Demo / selftest / apitest always run on a throw-away SQLite database.
+
+MONGO_URI = (os.getenv("MONGO_URI") or "").strip()
+MONGO_DB = (os.getenv("MONGO_DB") or "premiumvideo").strip() or "premiumvideo"
+
+try:
+    import pymongo as _pymongo
+    from pymongo import MongoClient, ReturnDocument
+except Exception:                      # pymongo is optional — SQLite works without it
+    _pymongo = None
+    MongoClient = None
+    ReturnDocument = None
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users(
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -223,41 +244,765 @@ CREATE INDEX IF NOT EXISTS idx_orders_state ON orders(status, id);
 """
 
 _LOCK = threading.RLock()
+_TABLES = ("users", "items", "orders", "unlocks", "settings", "states")
 
 
-def db() -> sqlite3.Connection:
+def _sqlite_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     return conn
 
 
-def init_db():
-    with _LOCK:
-        conn = db()
-        conn.executescript(SCHEMA)
-        conn.commit()
-        conn.close()
+# ==========================================================================
+# SQLite backend (the classic single-file database)
+# ==========================================================================
+class SQLiteStore:
+    name = "sqlite"
 
-
-def q(sql, args=()):
-    with _LOCK:
-        conn = db()
-        try:
-            return conn.execute(sql, args).fetchall()
-        finally:
-            conn.close()
-
-
-def x(sql, args=()):
-    with _LOCK:
-        conn = db()
-        try:
-            cur = conn.execute(sql, args)
+    def init(self):
+        with _LOCK:
+            conn = _sqlite_conn()
+            conn.executescript(SCHEMA)
             conn.commit()
-            return cur.lastrowid
-        finally:
             conn.close()
+
+    def _q(self, sql, args=()):
+        with _LOCK:
+            conn = _sqlite_conn()
+            try:
+                return [dict(r) for r in conn.execute(sql, args).fetchall()]
+            finally:
+                conn.close()
+
+    def _x(self, sql, args=()):
+        with _LOCK:
+            conn = _sqlite_conn()
+            try:
+                cur = conn.execute(sql, args)
+                conn.commit()
+                return cur.lastrowid
+            finally:
+                conn.close()
+
+    # ------------------------------ settings ------------------------------
+    def setting_get(self, key):
+        r = self._q("SELECT value FROM settings WHERE key=?", (key,))
+        return r[0]["value"] if r else None
+
+    def setting_set(self, key, value):
+        self._x("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, value or ""))
+
+    def settings_rows(self):
+        return self._q("SELECT key,value FROM settings")
+
+    # ------------------------------ states --------------------------------
+    def state_get(self, tg_id):
+        r = self._q("SELECT data, upd_at FROM states WHERE user_id=?", (int(tg_id),))
+        return r[0] if r else None
+
+    def state_set(self, tg_id, data_json):
+        self._x("INSERT INTO states(user_id,data,upd_at) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET "
+                "data=excluded.data, upd_at=excluded.upd_at", (int(tg_id), data_json, now()))
+
+    def state_del(self, tg_id):
+        self._x("DELETE FROM states WHERE user_id=?", (int(tg_id),))
+
+    # ------------------------------- users --------------------------------
+    def user_touch(self, tg_id, uname, name, admin):
+        """Insert-or-refresh a user; returns (bot_user_pk, was_created)."""
+        row = self._q("SELECT id FROM users WHERE tg_id=?", (int(tg_id),))
+        if row:
+            self._x("UPDATE users SET username=?, name=?, is_admin=?, last_seen=? WHERE id=?",
+                    (uname, name, int(admin), now(), row[0]["id"]))
+            return row[0]["id"], False
+        uid = self._x("INSERT INTO users(tg_id,username,name,is_admin,created_at,last_seen) VALUES(?,?,?,?,?,?)",
+                      (int(tg_id), uname, name, int(admin), now(), now()))
+        return uid, True
+
+    def user_by_tg(self, tg_id):
+        r = self._q("SELECT * FROM users WHERE tg_id=?", (int(tg_id),))
+        return r[0] if r else None
+
+    def user_by_id(self, pk):
+        r = self._q("SELECT * FROM users WHERE id=?", (int(pk),))
+        return r[0] if r else None
+
+    def user_find(self, v):
+        r = self._q("SELECT * FROM users WHERE id=? OR tg_id=?", (int(v), int(v)))
+        return r[0] if r else None
+
+    def is_blocked_tg(self, tg_id):
+        r = self._q("SELECT blocked FROM users WHERE tg_id=?", (int(tg_id),))
+        return bool(r and r[0]["blocked"])
+
+    def user_set_blocked(self, pk, flag):
+        self._x("UPDATE users SET blocked=? WHERE id=?", (1 if flag else 0, int(pk)))
+
+    def user_add_spent(self, pk, amount):
+        self._x("UPDATE users SET spent=spent+? WHERE id=?", (float(amount), int(pk)))
+
+    def user_add_order(self, pk):
+        self._x("UPDATE users SET orders=orders+1 WHERE id=?", (int(pk),))
+
+    def users_all(self):
+        return self._q("SELECT * FROM users ORDER BY id")
+
+    def customers_top(self, limit=30):
+        return self._q("SELECT * FROM users WHERE is_admin=0 ORDER BY spent DESC, id DESC LIMIT ?", (int(limit),))
+
+    def count_users(self):
+        return self._q("SELECT COUNT(*) c FROM users")[0]["c"]
+
+    def count_customers(self):
+        return self._q("SELECT COUNT(*) c FROM users WHERE is_admin=0")[0]["c"]
+
+    def count_active_since(self, ts_str):
+        return self._q("SELECT COUNT(*) c FROM users WHERE last_seen >= ?", (ts_str,))[0]["c"]
+
+    def broadcast_tg_ids(self):
+        return [r["tg_id"] for r in self._q("SELECT tg_id FROM users WHERE is_admin=0 AND blocked=0")]
+
+    # ------------------------------- items --------------------------------
+    def item_get(self, item_id):
+        r = self._q("SELECT * FROM items WHERE id=?", (int(item_id),))
+        return r[0] if r else None
+
+    def item_add(self, fields):
+        return self._x("""INSERT INTO items(kind,title,descr,file_id,file_kind,link,channel_link,group_link,
+                        price,validity_days,active,created_at,updated_at)
+                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       (fields.get("kind", "video"), fields.get("title", "Untitled"), fields.get("descr", ""),
+                        fields.get("file_id"), fields.get("file_kind"), fields.get("link"),
+                        fields.get("channel_link"), fields.get("group_link"),
+                        float(fields.get("price", 0) or 0), int(fields.get("validity_days", 0) or 0),
+                        1 if fields.get("active", 1) else 0, now(), now()))
+
+    _ITEM_FIELDS = {"kind", "title", "descr", "file_id", "file_kind", "link", "channel_link",
+                    "group_link", "price", "validity_days", "active"}
+
+    def item_set(self, item_id, field, value):
+        if field not in self._ITEM_FIELDS:
+            return False
+        self._x(f"UPDATE items SET {field}=?, updated_at=? WHERE id=?", (value, now(), int(item_id)))
+        return True
+
+    def item_delete(self, item_id):
+        self._x("DELETE FROM items WHERE id=?", (int(item_id),))
+
+    def item_inc_sold(self, item_id):
+        self._x("UPDATE items SET sold=sold+1 WHERE id=?", (int(item_id),))
+
+    def items_all_desc(self, limit=300):
+        return self._q("SELECT * FROM items ORDER BY id DESC LIMIT ?", (int(limit),))
+
+    def items_all_asc(self, limit=300):
+        return self._q("SELECT * FROM items ORDER BY id LIMIT ?", (int(limit),))
+
+    def items_active(self, search="", limit=300):
+        if search:
+            return self._q("SELECT * FROM items WHERE active=1 AND (title LIKE ? OR descr LIKE ?) "
+                           "ORDER BY id DESC LIMIT ?", (f"%{search}%", f"%{search}%", int(limit)))
+        return self._q("SELECT * FROM items WHERE active=1 ORDER BY id DESC LIMIT ?", (int(limit),))
+
+    def item_any_active(self):
+        r = self._q("SELECT * FROM items WHERE active=1 ORDER BY id DESC LIMIT 1")
+        return r[0] if r else None
+
+    def has_any_item(self):
+        return bool(self._q("SELECT id FROM items LIMIT 1"))
+
+    def item_min_active_price(self):
+        r = self._q("SELECT MIN(price) mn FROM items WHERE active=1")
+        return r[0]["mn"] if r else None
+
+    def count_active_items(self):
+        return self._q("SELECT COUNT(*) c FROM items WHERE active=1")[0]["c"]
+
+    # ------------------------------- orders -------------------------------
+    def order_create(self, user_pk, item_id, amount):
+        oid = self._x("INSERT INTO orders(no,user_id,item_id,amount,status,created_at) VALUES(?,?,?,?, 'pending', ?)",
+                      ("", int(user_pk), int(item_id), float(amount), now()))
+        self._x("UPDATE orders SET no=? WHERE id=?", (f"{oid:04d}", oid))
+        return oid
+
+    def order_get(self, oid):
+        r = self._q("SELECT * FROM orders WHERE id=?", (int(oid),))
+        return r[0] if r else None
+
+    def order_last(self):
+        r = self._q("SELECT * FROM orders ORDER BY id DESC LIMIT 1")
+        return r[0] if r else None
+
+    def order_update(self, oid, **fields):
+        if not fields:
+            return
+        sets = ", ".join(f"{k}=?" for k in fields)
+        self._x(f"UPDATE orders SET {sets} WHERE id=?", (*fields.values(), int(oid)))
+
+    def order_reopen(self, oid):
+        self._x("UPDATE orders SET status='pending', decided_at=NULL, reason=NULL WHERE id=?", (int(oid),))
+
+    def order_delivered(self, oid):
+        self._x("UPDATE orders SET delivered=1 WHERE id=?", (int(oid),))
+
+    def orders_pending_for_user(self, uid):
+        return self._q("SELECT * FROM orders WHERE user_id=? AND status='pending' ORDER BY id DESC", (int(uid),))
+
+    def orders_for_user(self, uid, limit=10):
+        return self._q("""SELECT o.*, i.title FROM orders o LEFT JOIN items i ON i.id=o.item_id
+                          WHERE o.user_id=? ORDER BY o.id DESC LIMIT ?""", (int(uid), int(limit)))
+
+    def orders_admin_list(self, only_pending=True, limit=60):
+        where = "o.status='pending'" if only_pending else "1=1"
+        return self._q(f"""SELECT o.*, i.title, u.name, u.tg_id, u.username FROM orders o
+                           LEFT JOIN items i ON i.id=o.item_id LEFT JOIN users u ON u.id=o.user_id
+                           WHERE {where} ORDER BY o.id DESC LIMIT ?""", (int(limit),))
+
+    def orders_recent(self, limit=15, status=None):
+        if status:
+            return self._q("SELECT * FROM orders WHERE status=? ORDER BY id DESC LIMIT ?",
+                           (status, int(limit)))
+        return self._q("SELECT * FROM orders ORDER BY id DESC LIMIT ?", (int(limit),))
+
+    def orders_all_count(self):
+        return self._q("SELECT COUNT(*) c FROM orders")[0]["c"]
+
+    def count_orders(self, status=None, user=None):
+        sql, args = "SELECT COUNT(*) c FROM orders", []
+        w = []
+        if status:
+            w.append("status=?"); args.append(status)
+        if user:
+            w.append("user_id=?"); args.append(int(user))
+        if w:
+            sql += " WHERE " + " AND ".join(w)
+        return self._q(sql, tuple(args))[0]["c"]
+
+    def sum_orders(self, status):
+        r = self._q("SELECT COUNT(*) c, COALESCE(SUM(amount),0) s FROM orders WHERE status=?", (status,))
+        return r[0]["c"], r[0]["s"]
+
+    def sum_approved_since(self, date_str):
+        r = self._q("SELECT COUNT(*) c, COALESCE(SUM(amount),0) s FROM orders "
+                    "WHERE status='approved' AND decided_at>=?", (date_str,))
+        return r[0]["c"], r[0]["s"]
+
+    def pending_ids(self):
+        return [r["id"] for r in self._q("SELECT id FROM orders WHERE status='pending' ORDER BY id")]
+
+    def best_sellers(self, limit=5):
+        return self._q("""SELECT i.id, i.title, COUNT(*) c, SUM(o.amount) s FROM orders o
+                          JOIN items i ON i.id=o.item_id WHERE o.status='approved'
+                          GROUP BY i.id ORDER BY s DESC LIMIT ?""", (int(limit),))
+
+    def buyers_of_item(self, item_id, limit=20):
+        return self._q("""SELECT o.amount, o.decided_at, u.name, u.id FROM orders o JOIN users u ON u.id=o.user_id
+                          WHERE o.item_id=? AND o.status='approved' ORDER BY o.id DESC LIMIT ?""",
+                       (int(item_id), int(limit)))
+
+    def last_approved_order(self, uid, item_id):
+        r = self._q("""SELECT * FROM orders WHERE user_id=? AND item_id=? AND status='approved'
+                       ORDER BY id DESC LIMIT 1""", (int(uid), int(item_id)))
+        return r[0] if r else None
+
+    # ------------------------------ unlocks -------------------------------
+    def unlock_upsert(self, uid, item_id, order_id, expires_at):
+        self._x("""INSERT INTO unlocks(user_id,item_id,order_id,created_at,expires_at) VALUES(?,?,?,?,?)
+                   ON CONFLICT(user_id,item_id) DO UPDATE SET expires_at=excluded.expires_at,
+                   order_id=excluded.order_id, created_at=excluded.created_at""",
+                (int(uid), int(item_id), order_id, now(), expires_at))
+
+    def unlock_get(self, uid, item_id):
+        r = self._q("SELECT * FROM unlocks WHERE user_id=? AND item_id=?", (int(uid), int(item_id)))
+        return r[0] if r else None
+
+    def unlock_delete(self, uid, item_id):
+        self._x("DELETE FROM unlocks WHERE user_id=? AND item_id=?", (int(uid), int(item_id)))
+
+    def count_unlocks(self, uid):
+        return self._q("SELECT COUNT(*) c FROM unlocks WHERE user_id=?", (int(uid),))[0]["c"]
+
+    def unlocks_by_order(self, oid):
+        return self._q("SELECT * FROM unlocks WHERE order_id=?", (int(oid),))
+
+    def library_rows(self, uid, limit=40):
+        return self._q("""SELECT u.expires_at, u.item_id, i.title, i.kind FROM unlocks u
+                          JOIN items i ON i.id=u.item_id WHERE u.user_id=? ORDER BY u.item_id DESC LIMIT ?""",
+                       (int(uid), int(limit)))
+
+    # --------------------------- demo / maintenance -----------------------
+    def table_dump(self, table, limit=10):
+        if table not in _TABLES:
+            return []
+        return self._q(f"SELECT * FROM {table} LIMIT ?", (int(limit),))
+
+    def reset_all(self):
+        for t in _TABLES:
+            self._x(f"DELETE FROM {t}")
+
+
+# ==========================================================================
+# MongoDB backend (recommended for data safety — enable with MONGO_URI)
+# ==========================================================================
+_USER_DEF = {"username": "", "name": "", "is_admin": 0, "blocked": 0, "ref": None, "orders": 0,
+             "spent": 0.0, "created_at": None, "last_seen": None}
+_ITEM_DEF = {"kind": "video", "title": "", "descr": "", "file_id": None, "file_kind": None,
+             "link": None, "channel_link": None, "group_link": None, "price": 0.0,
+             "validity_days": 0, "active": 1, "sold": 0, "created_at": None, "updated_at": None}
+_ORDER_DEF = {"no": "", "user_id": 0, "item_id": 0, "amount": 0.0, "status": "pending",
+              "proof_id": None, "proof_kind": None, "note": None, "reason": None,
+              "created_at": None, "decided_at": None, "decided_by": None, "delivered": 0}
+_UNLOCK_DEF = {"order_id": None, "created_at": None, "expires_at": None}
+
+
+class MongoStore:
+    name = "mongodb"
+
+    def __init__(self, uri, dbname, client=None):
+        # client can be injected (used by --selftest-mongo with mongomock)
+        self.client = client or MongoClient(uri, serverSelectionTimeoutMS=10000)
+        if client is None:
+            self.client.admin.command("ping")      # raises early if unreachable
+        self.d = self.client[dbname]
+        self.d.users.create_index("tg_id", unique=True)
+        self.d.users.create_index("id", unique=True)
+        self.d.items.create_index("id", unique=True)
+        self.d.orders.create_index("id", unique=True)
+        self.d.orders.create_index([("user_id", 1), ("status", 1)])
+        self.d.orders.create_index([("status", 1), ("id", -1)])
+        self.d.unlocks.create_index([("user_id", 1), ("item_id", 1)], unique=True)
+        self.d.settings.create_index("key", unique=True)
+        self.d.states.create_index("user_id", unique=True)
+
+    def init(self):
+        pass                                        # indexes created in __init__
+
+    def _next_id(self, coll):
+        doc = self.d.counters.find_one_and_update({"_id": coll}, {"$inc": {"seq": 1}},
+                                                  upsert=True, return_document=ReturnDocument.AFTER)
+        return int(doc["seq"])
+
+    @staticmethod
+    def _row(doc, defaults):
+        if not doc:
+            return None
+        out = dict(defaults)
+        out.update({k: v for k, v in doc.items() if k != "_id"})
+        return out
+
+    # ------------------------------ settings ------------------------------
+    def setting_get(self, key):
+        doc = self.d.settings.find_one({"key": key})
+        return doc.get("value") if doc else None
+
+    def setting_set(self, key, value):
+        self.d.settings.update_one({"key": key}, {"$set": {"value": value or ""}}, upsert=True)
+
+    def settings_rows(self):
+        return [{"key": r["key"], "value": r.get("value")} for r in self.d.settings.find({})]
+
+    # ------------------------------ states --------------------------------
+    def state_get(self, tg_id):
+        doc = self.d.states.find_one({"user_id": int(tg_id)})
+        if not doc:
+            return None
+        return {"data": doc.get("data"), "upd_at": doc.get("upd_at")}
+
+    def state_set(self, tg_id, data_json):
+        self.d.states.update_one({"user_id": int(tg_id)},
+                                 {"$set": {"data": data_json, "upd_at": now()}}, upsert=True)
+
+    def state_del(self, tg_id):
+        self.d.states.delete_one({"user_id": int(tg_id)})
+
+    # ------------------------------- users --------------------------------
+    def user_touch(self, tg_id, uname, name, admin):
+        doc = self.d.users.find_one({"tg_id": int(tg_id)})
+        if doc:
+            self.d.users.update_one({"_id": doc["_id"]},
+                                    {"$set": {"username": uname, "name": name,
+                                              "is_admin": int(admin), "last_seen": now()}})
+            return int(doc["id"]), False
+        uid = self._next_id("users")
+        row = dict(_USER_DEF)
+        row.update({"id": uid, "tg_id": int(tg_id), "username": uname, "name": name,
+                    "is_admin": int(admin), "created_at": now(), "last_seen": now()})
+        self.d.users.insert_one(row)
+        return uid, True
+
+    def user_by_tg(self, tg_id):
+        return self._row(self.d.users.find_one({"tg_id": int(tg_id)}), _USER_DEF)
+
+    def user_by_id(self, pk):
+        return self._row(self.d.users.find_one({"id": int(pk)}), _USER_DEF)
+
+    def user_find(self, v):
+        return self._row(self.d.users.find_one({"$or": [{"id": int(v)}, {"tg_id": int(v)}]}), _USER_DEF)
+
+    def is_blocked_tg(self, tg_id):
+        doc = self.d.users.find_one({"tg_id": int(tg_id)}, {"blocked": 1})
+        return bool(doc and doc.get("blocked"))
+
+    def user_set_blocked(self, pk, flag):
+        self.d.users.update_one({"id": int(pk)}, {"$set": {"blocked": 1 if flag else 0}})
+
+    def user_add_spent(self, pk, amount):
+        self.d.users.update_one({"id": int(pk)}, {"$inc": {"spent": float(amount)}})
+
+    def user_add_order(self, pk):
+        self.d.users.update_one({"id": int(pk)}, {"$inc": {"orders": 1}})
+
+    def users_all(self):
+        return [self._row(r, _USER_DEF) for r in self.d.users.find({}).sort("id", 1)]
+
+    def customers_top(self, limit=30):
+        return [self._row(r, _USER_DEF) for r in
+                self.d.users.find({"is_admin": 0}).sort([("spent", -1), ("id", -1)]).limit(int(limit))]
+
+    def count_users(self):
+        return self.d.users.count_documents({})
+
+    def count_customers(self):
+        return self.d.users.count_documents({"is_admin": 0})
+
+    def count_active_since(self, ts_str):
+        return self.d.users.count_documents({"last_seen": {"$gte": ts_str}})
+
+    def broadcast_tg_ids(self):
+        return [int(t) for t in self.d.users.distinct("tg_id", {"is_admin": 0, "blocked": 0})]
+
+    # ------------------------------- items --------------------------------
+    def item_get(self, item_id):
+        return self._row(self.d.items.find_one({"id": int(item_id)}), _ITEM_DEF)
+
+    def item_add(self, fields):
+        iid = self._next_id("items")
+        row = dict(_ITEM_DEF)
+        row.update({"id": iid,
+                    "kind": fields.get("kind", "video"), "title": fields.get("title", "Untitled"),
+                    "descr": fields.get("descr", ""), "file_id": fields.get("file_id"),
+                    "file_kind": fields.get("file_kind"), "link": fields.get("link"),
+                    "channel_link": fields.get("channel_link"), "group_link": fields.get("group_link"),
+                    "price": float(fields.get("price", 0) or 0),
+                    "validity_days": int(fields.get("validity_days", 0) or 0),
+                    "active": 1 if fields.get("active", 1) else 0,
+                    "created_at": now(), "updated_at": now()})
+        self.d.items.insert_one(row)
+        return iid
+
+    _ITEM_FIELDS = SQLiteStore._ITEM_FIELDS
+
+    def item_set(self, item_id, field, value):
+        if field not in self._ITEM_FIELDS:
+            return False
+        self.d.items.update_one({"id": int(item_id)}, {"$set": {field: value, "updated_at": now()}})
+        return True
+
+    def item_delete(self, item_id):
+        self.d.items.delete_one({"id": int(item_id)})
+
+    def item_inc_sold(self, item_id):
+        self.d.items.update_one({"id": int(item_id)}, {"$inc": {"sold": 1}})
+
+    def items_all_desc(self, limit=300):
+        return [self._row(r, _ITEM_DEF) for r in self.d.items.find({}).sort("id", -1).limit(int(limit))]
+
+    def items_all_asc(self, limit=300):
+        return [self._row(r, _ITEM_DEF) for r in self.d.items.find({}).sort("id", 1).limit(int(limit))]
+
+    def items_active(self, search="", limit=300):
+        flt = {"active": 1}
+        if search:
+            rx = {"$regex": re.escape(search), "$options": "i"}
+            flt["$or"] = [{"title": rx}, {"descr": rx}]
+        return [self._row(r, _ITEM_DEF) for r in self.d.items.find(flt).sort("id", -1).limit(int(limit))]
+
+    def item_any_active(self):
+        return self._row(self.d.items.find_one({"active": 1}, sort=[("id", -1)]), _ITEM_DEF)
+
+    def has_any_item(self):
+        return self.d.items.find_one({}, {"id": 1}) is not None
+
+    def item_min_active_price(self):
+        doc = self.d.items.find_one({"active": 1}, sort=[("price", 1)])
+        return doc.get("price") if doc else None
+
+    def count_active_items(self):
+        return self.d.items.count_documents({"active": 1})
+
+    # ------------------------------- orders -------------------------------
+    def order_create(self, user_pk, item_id, amount):
+        oid = self._next_id("orders")
+        row = dict(_ORDER_DEF)
+        row.update({"id": oid, "no": f"{oid:04d}", "user_id": int(user_pk), "item_id": int(item_id),
+                    "amount": float(amount), "status": "pending", "created_at": now()})
+        self.d.orders.insert_one(row)
+        return oid
+
+    def order_get(self, oid):
+        return self._row(self.d.orders.find_one({"id": int(oid)}), _ORDER_DEF)
+
+    def order_last(self):
+        return self._row(self.d.orders.find_one({}, sort=[("id", -1)]), _ORDER_DEF)
+
+    def order_update(self, oid, **fields):
+        if fields:
+            self.d.orders.update_one({"id": int(oid)}, {"$set": fields})
+
+    def order_reopen(self, oid):
+        self.d.orders.update_one({"id": int(oid)},
+                                 {"$set": {"status": "pending", "decided_at": None, "reason": None}})
+
+    def order_delivered(self, oid):
+        self.d.orders.update_one({"id": int(oid)}, {"$set": {"delivered": 1}})
+
+    def orders_pending_for_user(self, uid):
+        return [self._row(r, _ORDER_DEF) for r in
+                self.d.orders.find({"user_id": int(uid), "status": "pending"}).sort("id", -1)]
+
+    def _with_titles(self, orders):
+        ids = list({int(o["item_id"]) for o in orders if o.get("item_id")})
+        titles = {d["id"]: d.get("title") for d in self.d.items.find({"id": {"$in": ids}}, {"id": 1, "title": 1})}
+        for o in orders:
+            o["title"] = titles.get(o["item_id"])
+        return orders
+
+    def orders_for_user(self, uid, limit=10):
+        rows = [self._row(r, _ORDER_DEF) for r in
+                self.d.orders.find({"user_id": int(uid)}).sort("id", -1).limit(int(limit))]
+        return self._with_titles(rows)
+
+    def orders_admin_list(self, only_pending=True, limit=60):
+        flt = {"status": "pending"} if only_pending else {}
+        rows = [self._row(r, _ORDER_DEF) for r in
+                self.d.orders.find(flt).sort("id", -1).limit(int(limit))]
+        rows = self._with_titles(rows)
+        uids = list({int(o["user_id"]) for o in rows if o.get("user_id")})
+        users = {d["id"]: d for d in self.d.users.find({"id": {"$in": uids}})}
+        for o in rows:
+            u = users.get(o["user_id"]) or {}
+            o["name"] = u.get("name") or "?"
+            o["username"] = u.get("username") or ""
+            o["tg_id"] = u.get("tg_id") or 0
+        return rows
+
+    def orders_recent(self, limit=15, status=None):
+        flt = {"status": status} if status else {}
+        return [self._row(r, _ORDER_DEF) for r in
+                self.d.orders.find(flt).sort("id", -1).limit(int(limit))]
+
+    def orders_all_count(self):
+        return self.d.orders.count_documents({})
+
+    def count_orders(self, status=None, user=None):
+        flt = {}
+        if status:
+            flt["status"] = status
+        if user:
+            flt["user_id"] = int(user)
+        return self.d.orders.count_documents(flt)
+
+    def sum_orders(self, status):
+        agg = list(self.d.orders.aggregate([{"$match": {"status": status}},
+                                            {"$group": {"_id": None, "c": {"$sum": 1}, "s": {"$sum": "$amount"}}}]))
+        if not agg:
+            return 0, 0.0
+        return int(agg[0]["c"]), float(agg[0]["s"] or 0)
+
+    def sum_approved_since(self, date_str):
+        agg = list(self.d.orders.aggregate([{"$match": {"status": "approved", "decided_at": {"$gte": date_str}}},
+                                            {"$group": {"_id": None, "c": {"$sum": 1}, "s": {"$sum": "$amount"}}}]))
+        if not agg:
+            return 0, 0.0
+        return int(agg[0]["c"]), float(agg[0]["s"] or 0)
+
+    def pending_ids(self):
+        return [r["id"] for r in self.d.orders.find({"status": "pending"}, {"id": 1}).sort("id", 1)]
+
+    def best_sellers(self, limit=5):
+        agg = list(self.d.orders.aggregate([
+            {"$match": {"status": "approved"}},
+            {"$group": {"_id": "$item_id", "c": {"$sum": 1}, "s": {"$sum": "$amount"}}},
+            {"$sort": {"s": -1}}, {"$limit": int(limit)}]))
+        ids = [a["_id"] for a in agg]
+        titles = {d["id"]: d.get("title") for d in self.d.items.find({"id": {"$in": ids}}, {"id": 1, "title": 1})}
+        return [{"id": a["_id"], "title": titles.get(a["_id"], "?"), "c": int(a["c"]), "s": float(a["s"] or 0)}
+                for a in agg]
+
+    def buyers_of_item(self, item_id, limit=20):
+        rows = [self._row(r, _ORDER_DEF) for r in
+                self.d.orders.find({"item_id": int(item_id), "status": "approved"}).sort("id", -1).limit(int(limit))]
+        uids = list({int(o["user_id"]) for o in rows})
+        users = {d["id"]: d for d in self.d.users.find({"id": {"$in": uids}})}
+        return [{"amount": o["amount"], "decided_at": o["decided_at"],
+                 "name": (users.get(o["user_id"]) or {}).get("name") or "?",
+                 "id": o["user_id"]} for o in rows]
+
+    def last_approved_order(self, uid, item_id):
+        return self._row(self.d.orders.find_one({"user_id": int(uid), "item_id": int(item_id),
+                                                 "status": "approved"}, sort=[("id", -1)]), _ORDER_DEF)
+
+    # ------------------------------ unlocks -------------------------------
+    def unlock_upsert(self, uid, item_id, order_id, expires_at):
+        self.d.unlocks.update_one({"user_id": int(uid), "item_id": int(item_id)},
+                                  {"$set": {"order_id": order_id, "created_at": now(),
+                                            "expires_at": expires_at}}, upsert=True)
+
+    def unlock_get(self, uid, item_id):
+        return self._row(self.d.unlocks.find_one({"user_id": int(uid), "item_id": int(item_id)}), _UNLOCK_DEF)
+
+    def unlock_delete(self, uid, item_id):
+        self.d.unlocks.delete_one({"user_id": int(uid), "item_id": int(item_id)})
+
+    def count_unlocks(self, uid):
+        return self.d.unlocks.count_documents({"user_id": int(uid)})
+
+    def unlocks_by_order(self, oid):
+        return [self._row(r, _UNLOCK_DEF) for r in self.d.unlocks.find({"order_id": int(oid)})]
+
+    def library_rows(self, uid, limit=40):
+        rows = [self._row(r, _UNLOCK_DEF) for r in
+                self.d.unlocks.find({"user_id": int(uid)}).sort("item_id", -1).limit(int(limit))]
+        ids = [r["item_id"] for r in rows]
+        items = {d["id"]: d for d in self.d.items.find({"id": {"$in": ids}})}
+        out = []
+        for r in rows:
+            it = items.get(r["item_id"]) or {}
+            out.append({"expires_at": r["expires_at"], "item_id": r["item_id"],
+                        "title": it.get("title") or "(deleted item)", "kind": it.get("kind") or "video"})
+        return out
+
+    # --------------------------- demo / maintenance -----------------------
+    def table_dump(self, table, limit=10):
+        if table not in _TABLES:
+            return []
+        coll = {"users": (_USER_DEF, None), "items": (_ITEM_DEF, None), "orders": (_ORDER_DEF, None),
+                "unlocks": (_UNLOCK_DEF, None)}.get(table)
+        docs = list(self.d[table].find({}).limit(int(limit)))
+        if coll:
+            return [self._row(r, coll[0]) for r in docs]
+        out = []
+        for r in docs:
+            r.pop("_id", None)
+            if table == "settings":
+                out.append({"key": r.get("key"), "value": r.get("value")})
+            else:
+                out.append({"user_id": r.get("user_id"), "data": r.get("data"), "upd_at": r.get("upd_at")})
+        return out
+
+    def reset_all(self):
+        for t in _TABLES:
+            self.d[t].delete_many({})
+        self.d.counters.delete_many({})
+
+
+# ==========================================================================
+# backend selection + legacy helpers
+# ==========================================================================
+STORE = None                      # set by init_db()
+
+
+def init_db(force_sqlite: bool = False):
+    """Pick the storage backend. MongoDB when MONGO_URI is set (and pymongo
+    installed), otherwise the local SQLite file. Called once at startup."""
+    global STORE
+    if STORE is not None:
+        return STORE
+    if MONGO_URI and not force_sqlite:
+        if MongoClient is None:
+            log("❌ MONGO_URI is set but pymongo is missing — install it with:  pip install pymongo")
+            sys.exit(2)
+        try:
+            STORE = MongoStore(MONGO_URI, MONGO_DB)
+            STORE.init()
+            log(f"🍃 MongoDB connected — database '{MONGO_DB}'")
+            return STORE
+        except Exception as e:
+            log(f"❌ MongoDB connection failed: {e}")
+            log("   Fix MONGO_URI — or unset it to fall back to the local SQLite file.")
+            sys.exit(2)
+    STORE = SQLiteStore()
+    STORE.init()
+    return STORE
+
+
+# --- Premium (custom) emoji ------------------------------------------------------------
+# Telegram Premium feature: real animated custom emoji in messages (<tg-emoji>) and
+# custom emoji icons on inline buttons (icon_custom_emoji_id, Bot API 9.4+).
+# Works when the bot owner has Telegram Premium or the bot has a Fragment username.
+# Set PREMIUM_EMOJI=0 to fall back to plain unicode emoji everywhere.
+#
+# IDs come from TWO places:
+#   1. the hardcoded base set below (user-side animated emoji)
+#   2. every JSON file in the "ADMIN PANEL EMOJI ID/" folder — these are loaded at
+#      startup and OVERRIDE the base set, so admins can drop in their own ids there.
+PREMIUM_EMOJI = os.environ.get("PREMIUM_EMOJI", "1").strip().lower() not in ("0", "false", "no", "off")
+
+EMOJI_ID_DIR = os.path.join(ROOT, "ADMIN PANEL EMOJI ID")
+
+
+def _load_repo_emoji_ids() -> dict:
+    """Load emoji → custom_emoji_id from every JSON .txt in EMOJI_ID_DIR.
+    First occurrence wins; both '⚙' and '⚙️' (variation selector) forms map to the id."""
+    out = {}
+    try:
+        names = sorted(os.listdir(EMOJI_ID_DIR))
+    except OSError:
+        return out
+    for fn in names:
+        if not fn.lower().endswith((".txt", ".json")):
+            continue
+        try:
+            with open(os.path.join(EMOJI_ID_DIR, fn), encoding="utf-8") as fh:
+                data = json.load(fh)
+        except Exception:
+            continue
+        for row in data if isinstance(data, list) else []:
+            if not isinstance(row, dict):
+                continue
+            e = row.get("emoji")
+            i = row.get("custom_emoji_id") or row.get("id")
+            if not (e and i):
+                continue
+            i = str(i)
+            for variant in {e, e + "\ufe0f", e.replace("\ufe0f", "")}:
+                out.setdefault(variant, i)
+    return out
+
+
+PEMOJI = {  # emoji char -> custom_emoji_id (fallback char stays inside the tag)
+    # ---- user side (animated premium emoji) ----
+    "💦": "6310096377107975749",
+    "🍑": "6311843256271376001",
+    "🥵": "6307832826263768178",
+    "🍭": "6312109432574577731",
+    "🍆": "6312111867821035183",
+    "🍒": "6312070305422512477",
+    "🌸": "6309771875148893373",
+    "😘": "6312213392257979167",
+    "👅": "6311998326065597286",
+    "😄": "6332146103550479433",
+}
+# admin/shared side ids come from the repo folder (drop your own files there to change them)
+PEMOJI.update(_load_repo_emoji_ids())
+_TG_EMOJI_RE = re.compile(r'<tg-emoji emoji-id="\d+">(.*?)</tg-emoji>')
+
+
+_PE_RE = None
+
+
+def pe(text: str) -> str:
+    """Swap every mapped emoji char for its premium <tg-emoji> version (user-facing texts).
+    Single regex pass (longest match first) so an emoji can never be replaced twice."""
+    global _PE_RE
+    if not (PREMIUM_EMOJI and text):
+        return text
+    if _PE_RE is None:
+        keys = sorted(PEMOJI, key=len, reverse=True)
+        _PE_RE = re.compile("|".join(re.escape(k) for k in keys))
+    return _PE_RE.sub(lambda m: f'<tg-emoji emoji-id="{PEMOJI[m.group(0)]}">{m.group(0)}</tg-emoji>', text)
 
 
 # ------------------------------- settings ---------------------------------
@@ -281,52 +1026,21 @@ DEFAULTS = {
     "stats_today": "",
 }
 
-# --- Premium (custom) emoji ------------------------------------------------------------
-# Telegram Premium feature: real animated custom emoji in messages (<tg-emoji>) and
-# custom emoji icons on inline buttons (icon_custom_emoji_id, Bot API 9.4+).
-# Works when the bot owner has Telegram Premium or the bot has a Fragment username.
-# Set PREMIUM_EMOJI=0 to fall back to plain unicode emoji everywhere.
-PREMIUM_EMOJI = os.environ.get("PREMIUM_EMOJI", "1").strip().lower() not in ("0", "false", "no", "off")
-PEMOJI = {  # emoji char -> custom_emoji_id (fallback char stays inside the tag)
-    "💦": "6310096377107975749",
-    "🍑": "6311843256271376001",
-    "🥵": "6307832826263768178",
-    "🍭": "6312109432574577731",
-    "🍆": "6312111867821035183",
-    "🍒": "6312070305422512477",
-    "🌸": "6309771875148893373",
-    "😘": "6312213392257979167",
-    "👅": "6311998326065597286",
-    "😄": "6332146103550479433",
-}
-_TG_EMOJI_RE = re.compile(r'<tg-emoji emoji-id="\d+">(.*?)</tg-emoji>')
-
-
-def pe(text: str) -> str:
-    """Swap every mapped emoji char for its premium <tg-emoji> version (user-facing texts)."""
-    if not (PREMIUM_EMOJI and text):
-        return text
-    for ch, eid in PEMOJI.items():
-        if ch in text:
-            text = text.replace(ch, f'<tg-emoji emoji-id="{eid}">{ch}</tg-emoji>')
-    return text
-
 
 def setting(key: str, default: str = "") -> str:
-    row = q("SELECT value FROM settings WHERE key=?", (key,))
-    if row and row[0]["value"] not in (None, ""):
-        return row[0]["value"]
+    value = STORE.setting_get(key)
+    if value not in (None, ""):
+        return value
     return DEFAULTS.get(key, default) or default
 
 
 def set_setting(key: str, value: str):
-    x("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-      (key, value or ""))
+    STORE.setting_set(key, value or "")
 
 
 def all_settings() -> dict:
     d = dict(DEFAULTS)
-    for r in q("SELECT key,value FROM settings"):
+    for r in STORE.settings_rows():
         if r["value"]:
             d[r["key"]] = r["value"]
     return d
@@ -338,64 +1052,44 @@ def ensure_user(u: dict) -> int:
     name = " ".join([v for v in [u.get("first_name"), u.get("last_name")] if v]).strip() or (u.get("username") or "User")
     uname = "@" + u["username"] if u.get("username") else ""
     admin = 1 if tg_id in ADMIN_IDS else 0
-    row = q("SELECT id FROM users WHERE tg_id=?", (tg_id,))
-    if row:
-        uid = row[0]["id"]
-        x("UPDATE users SET username=?, name=?, is_admin=?, last_seen=? WHERE id=?", (uname, name, admin, now(), uid))
-        return uid
-    uid = x("INSERT INTO users(tg_id,username,name,is_admin,created_at,last_seen) VALUES(?,?,?,?,?,?)",
-            (tg_id, uname, name, admin, now(), now()))
-    log(f"new user tg={tg_id} ({name})")
+    uid, created = STORE.user_touch(tg_id, uname, name, admin)
+    if created:
+        log(f"new user tg={tg_id} ({name})")
     return uid
 
 
 def user_by_tg(tg_id: int):
-    row = q("SELECT * FROM users WHERE tg_id=?", (int(tg_id),))
-    return row[0] if row else None
+    return STORE.user_by_tg(tg_id)
 
 
 def user_by_id(pk: int):
-    row = q("SELECT * FROM users WHERE id=?", (int(pk),))
-    return row[0] if row else None
+    return STORE.user_by_id(pk)
 
 
 def is_blocked(tg_id: int) -> bool:
-    row = q("SELECT blocked FROM users WHERE tg_id=?", (int(tg_id),))
-    return bool(row and row[0]["blocked"])
+    return STORE.is_blocked_tg(tg_id)
 
 
 # --------------------------------- items ----------------------------------
 def get_item(item_id: int):
-    row = q("SELECT * FROM items WHERE id=?", (int(item_id),))
-    return row[0] if row else None
+    return STORE.item_get(item_id)
 
 
 def add_item(**kw) -> int:
-    return x("""INSERT INTO items(kind,title,descr,file_id,file_kind,link,channel_link,group_link,
-                price,validity_days,active,created_at,updated_at)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-             (kw.get("kind", "video"), kw.get("title", "Untitled"), kw.get("descr", ""),
-              kw.get("file_id"), kw.get("file_kind"), kw.get("link"), kw.get("channel_link"),
-              kw.get("group_link"), float(kw.get("price", 0) or 0), int(kw.get("validity_days", 0) or 0),
-              1 if kw.get("active", 1) else 0, now(), now()))
+    return STORE.item_add(kw)
 
 
 def set_item(item_id: int, field: str, value) -> bool:
-    allowed = {"kind", "title", "descr", "file_id", "file_kind", "link", "channel_link",
-               "group_link", "price", "validity_days", "active"}
-    if field not in allowed:
-        return False
-    x(f"UPDATE items SET {field}=?, updated_at=? WHERE id=?", (value, now(), int(item_id)))
-    return True
+    return STORE.item_set(item_id, field, value)
 
 
 def has_access(user_pk: int, item_id: int) -> bool:
-    row = q("SELECT expires_at FROM unlocks WHERE user_id=? AND item_id=?", (int(user_pk), int(item_id)))
+    row = STORE.unlock_get(user_pk, item_id)
     if not row:
         return False
-    exp = row[0]["expires_at"]
+    exp = row["expires_at"]
     if exp and exp < now():
-        x("DELETE FROM unlocks WHERE user_id=? AND item_id=?", (int(user_pk), int(item_id)))
+        STORE.unlock_delete(user_pk, item_id)
         return False
     return True
 
@@ -408,55 +1102,48 @@ def grant_access(user_pk: int, item_id: int, order_id=None, validity_days=0):
         validity_days = 0
     if validity_days > 0:
         expires = (datetime.now() + timedelta(days=validity_days)).strftime("%Y-%m-%d %H:%M:%S")
-    x("""INSERT INTO unlocks(user_id,item_id,order_id,created_at,expires_at) VALUES(?,?,?,?,?)
-         ON CONFLICT(user_id,item_id) DO UPDATE SET expires_at=excluded.expires_at,
-         order_id=excluded.order_id, created_at=excluded.created_at""",
-      (int(user_pk), int(item_id), order_id, now(), expires))
+    STORE.unlock_upsert(user_pk, item_id, order_id, expires)
 
 
 # --------------------------------- orders ---------------------------------
 def create_order(user_pk: int, item, amount=None) -> int:
     amt = float(item["price"]) if amount is None else float(amount)
-    oid = x("INSERT INTO orders(no,user_id,item_id,amount,status,created_at) VALUES(?,?,?,?, 'pending', ?)",
-            ("", int(user_pk), int(item["id"]), amt, now()))
-    x("UPDATE orders SET no=? WHERE id=?", (f"{oid:04d}", oid))
-    x("UPDATE users SET orders=orders+1 WHERE id=?", (int(user_pk),))
+    oid = STORE.order_create(user_pk, item["id"], amt)
+    STORE.user_add_order(user_pk)
     return oid
 
 
 def get_order(oid: int):
-    row = q("SELECT * FROM orders WHERE id=?", (int(oid),))
-    return row[0] if row else None
+    return STORE.order_get(oid)
 
 
 def pending_for_user(user_pk: int):
-    return q("SELECT * FROM orders WHERE user_id=? AND status='pending' ORDER BY id DESC", (int(user_pk),))
+    return STORE.orders_pending_for_user(user_pk)
 
 
 # ------------------------------ FSM states --------------------------------
 def get_state(tg_id: int) -> dict:
-    row = q("SELECT data, upd_at FROM states WHERE user_id=?", (int(tg_id),))
-    if not row or not row[0]["data"]:
+    row = STORE.state_get(tg_id)
+    if not row or not row["data"]:
         return {}
     try:
-        age = datetime.now() - datetime.strptime(row[0]["upd_at"], "%Y-%m-%d %H:%M:%S")
+        age = datetime.now() - datetime.strptime(row["upd_at"], "%Y-%m-%d %H:%M:%S")
         if age.total_seconds() > STATE_TTL_HOURS * 3600:
-            x("DELETE FROM states WHERE user_id=?", (int(tg_id),))
+            STORE.state_del(tg_id)
             return {}
     except Exception:
         pass
     try:
-        return json.loads(row[0]["data"])
+        return json.loads(row["data"])
     except Exception:
         return {}
 
 
 def set_state(tg_id: int, data: dict):
     if not data:
-        x("DELETE FROM states WHERE user_id=?", (int(tg_id),))
+        STORE.state_del(tg_id)
     else:
-        x("INSERT INTO states(user_id,data,upd_at) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET "
-          "data=excluded.data, upd_at=excluded.upd_at", (int(tg_id), json.dumps(data, ensure_ascii=False), now()))
+        STORE.state_set(tg_id, json.dumps(data, ensure_ascii=False))
 
 
 # ==========================================================================
@@ -852,7 +1539,7 @@ class PremiumBot:
                                  kb(rows([btn("🛍 Browse store", "shop:0")])))
         if cmd == "/unstick":
             target = re.sub(r"\D", "", arg) or str(tg_id)
-            x("DELETE FROM states WHERE user_id=?", (int(target),))
+            STORE.state_del(int(target))
             msg = "Your pending step was reset." if not admin else f"Reset the pending step of <code>{target}</code>."
             return self.bot.send(chat_id, msg, kb(rows([btn("🏠 Home", "home")])))
 
@@ -932,9 +1619,9 @@ class PremiumBot:
             m30 = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
             d0 = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
             d0 = d0.strftime("%Y-%m-%d %H:%M:%S")
-            rj = q("SELECT COUNT(*) c FROM users")[0]["c"]
-            rm = q("SELECT COUNT(*) c FROM users WHERE last_seen >= ?", (m30,))[0]["c"]
-            rt = q("SELECT COUNT(*) c FROM users WHERE last_seen >= ?", (d0,))[0]["c"]
+            rj = STORE.count_users()
+            rm = STORE.count_active_since(m30)
+            rt = STORE.count_active_since(d0)
             joined = joined or str(rj)
             month = month or str(rm)
             today = today or str(rt)
@@ -952,16 +1639,21 @@ class PremiumBot:
 
     def default_welcome(self) -> str:
         s = all_settings()
-        price = q("SELECT MIN(price) mn FROM items WHERE active=1")
-        lowest = price[0]["mn"] if price and price[0]["mn"] is not None else None
-        lines = [f"🍆 <b><u>{esc(s['brand'])}</u></b>",
+        lowest = STORE.item_min_active_price()
+        lines = [f"🏆 <b><u>{esc(s['brand'])}</u></b>",
                  "",
-                 "<blockquote>💦 <i>Premium videos, courses & VIP access</i> —\n"
+                 "<blockquote>👋 <b>Welcome!</b> Premium videos, courses & VIP access —\n"
                  "delivered <b>instantly</b> after payment verification. 🔐</blockquote>",
                  "",
-                 f"🥵 Plans from <b>{money(lowest)}</b> · 🍭 some drops are <i>free</i>"
-                 if lowest is not None else "🍑 New videos are added by the admin",
-                 f"🤫 <tg-spoiler>new uploads every week — stay tuned</tg-spoiler>"]
+                 "✨ <b>Why buy from us?</b>",
+                 "⚡ Instant delivery after approval",
+                 "🔒 100% safe & trusted payments",
+                 "💎 Premium quality content",
+                 "🎁 New free drops every week",
+                 "",
+                 (f"💵 Plans start at <b>{money(lowest)}</b> — tap below & explore 👇"
+                  if lowest is not None else
+                  "🛍 Fresh content is added regularly — tap below & explore 👇")]
         return pe("\n".join(lines))
 
     def welcome_body(self) -> str:
@@ -1067,12 +1759,7 @@ class PremiumBot:
         return "\n".join([l for l in out if l != ""])
 
     def show_store(self, chat_id, uid, page=0, search=""):
-        args = []
-        where = "active=1"
-        if search:
-            where += " AND (title LIKE ? OR descr LIKE ?)"
-            args = [f"%{search}%", f"%{search}%"]
-        allitems = q(f"SELECT * FROM items WHERE {where} ORDER BY id DESC LIMIT 300", tuple(args))
+        allitems = STORE.items_active(search, 300)
         total = len(allitems)
         pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
         page = max(0, min(int(page), pages - 1))
@@ -1225,7 +1912,7 @@ class PremiumBot:
     def show_profile(self, chat_id, uid):
         row = user_by_id(uid)
         u = dict(row) if row else {}
-        lib = q("SELECT COUNT(*) c FROM unlocks WHERE user_id=?", (int(uid),))[0]["c"]
+        lib = STORE.count_unlocks(uid)
         body = ["🌸 <b><u>My profile</u></b>",
                 "",
                 f"🆔 Bot ID: <code>{uid}</code> · TG: <code>{esc(str(u.get('tg_id', '')))}</code>",
@@ -1281,8 +1968,8 @@ class PremiumBot:
                                  pe("📸 Please send the actual <b>screenshot</b> of the payment "
                                     "(photo or file) — a text message can't be verified."),
                                  kb(rows([btn("❌ Cancel order", f"cancel:{order['id']}", style="danger")])))
-        x("UPDATE orders SET proof_id=?, proof_kind=?, note=? WHERE id=?",
-          (media["file_id"], media["file_kind"], (note or "")[:200], int(order["id"])))
+        STORE.order_update(int(order["id"]), proof_id=media["file_id"],
+                           proof_kind=media["file_kind"], note=(note or "")[:200])
         set_state(tg_id, {})
         order = get_order(order["id"])
         it = get_item(order["item_id"])
@@ -1302,7 +1989,7 @@ class PremiumBot:
             return self.bot.send(chat_id, "❌ Order not found.")
         if o["status"] != "pending":
             return self.bot.send(chat_id, f"Order #{o['no']} is already <b>{o['status']}</b> — nothing to cancel.")
-        x("UPDATE orders SET status='cancelled', decided_at=? WHERE id=?", (now(), int(oid)))
+        STORE.order_update(int(oid), status="cancelled", decided_at=now())
         set_state(int(self.tg_of(uid) or 0), {})
         self.bot.send(chat_id, pe(f"🗑 Order <b>#{o['no']}</b> was cancelled."),
                       kb(rows([ubtn("Browse store", "shop:0", icon="🍑", style="primary")],
@@ -1314,9 +2001,7 @@ class PremiumBot:
     # LIBRARY / ORDERS
     # ======================================================================
     def show_library(self, chat_id, uid):
-        rows_ = q("""SELECT u.expires_at, u.item_id, i.title, i.kind FROM unlocks u
-                     JOIN items i ON i.id=u.item_id WHERE u.user_id=? ORDER BY u.item_id DESC LIMIT 40""",
-                  (int(uid),))
+        rows_ = STORE.library_rows(uid, 40)
         if not rows_:
             return self.bot.send(chat_id,
                                  pe("🍒 <b>Your library is empty</b>\n" + SEP + "\n"
@@ -1335,8 +2020,7 @@ class PremiumBot:
                       kb(buttons))
 
     def show_orders(self, chat_id, uid):
-        rows_ = q("""SELECT o.*, i.title FROM orders o JOIN items i ON i.id=o.item_id
-                     WHERE o.user_id=? ORDER BY o.id DESC LIMIT 10""", (int(uid),))
+        rows_ = STORE.orders_for_user(uid, 10)
         if not rows_:
             return self.bot.send(chat_id,
                                  pe("🧾 <b>No orders yet</b>\n" + SEP + "\nPick an item and pay — the order will show here."),
@@ -1366,32 +2050,67 @@ class PremiumBot:
         return u["tg_id"] if u else None
 
     def deliver(self, uid, it, order):
+        """Content delivery — a professional 'Purchase successful' receipt card."""
         chat = self.tg_of(uid)
         if not chat:
             for a in ADMIN_IDS:
                 self.bot.send(a, f"⚠️ Cannot deliver <b>{esc(it['title'])}</b> — no Telegram id for bot user {uid}.")
             return False
+        s = all_settings()
+        o = order or STORE.last_approved_order(uid, it["id"])
+
+        # ---- access line ----
         if not it["validity_days"]:
-            tail = "♾ Lifetime access"
+            access = "♾️ Access: <b>Lifetime</b>"
         else:
             exp = (datetime.now() + timedelta(days=int(it["validity_days"]))).strftime("%d %b %Y")
-            tail = f"⏱ {it['validity_days']} days access (until {exp})"
-        head = pe(f"🍒 <b>{esc(it['title'])}</b>\n{SEP}\n{tail}")
-        if it["descr"]:
-            head += "\n\n" + esc(it["descr"])[:900]
+            access = f"⏱ Access: <b>{it['validity_days']} days</b> (valid till {exp})"
+
+        # ---- receipt card ----
+        if o and float(o["amount"] or 0) > 0:
+            headline = "✅ <b>PURCHASE SUCCESSFUL</b> 🎉"
+            pay_line = f"💰 You paid: <b>{money(o['amount'])}</b>"
+            order_line = f"🧾 Order ID: <b>#{o['no']}</b> · {ts(o['decided_at'] or o['created_at'])}"
+            price_tag = f" · {money(o['amount'])}"
+        else:
+            headline = "🎁 <b>ACCESS UNLOCKED</b> ✨"
+            pay_line = "💰 Price: <b>FREE</b>"
+            order_line = f"🧾 Unlocked: {ts((o or {}).get('decided_at') or (o or {}).get('created_at') or now())}"
+            price_tag = " · FREE"
+
+        body = [headline, SEP,
+                f"🎬 <b>{esc(it['title'])}</b>", "",
+                pay_line, order_line, access, SEP]
+        # admin's description — shown only when the admin actually wrote one
+        if (it["descr"] or "").strip():
+            body += ["📝 <b>Description</b>", f"<blockquote>{esc(it['descr'])[:900]}</blockquote>", ""]
+        # links — clickable right here in the chat AND as buttons below
+        link_lines = []
+        if it["link"]:
+            link_lines.append(f"🔗 Main link: <a href=\"{t_url(it['link'])}\">{esc(shorten(it['link'], 40))}</a>")
+        if it["channel_link"]:
+            link_lines.append(f"📢 Channel: <a href=\"{t_url(it['channel_link'])}\">Join channel</a>")
+        if it["group_link"]:
+            link_lines.append(f"👥 Group: <a href=\"{t_url(it['group_link'])}\">Join group</a>")
+        if link_lines:
+            body += link_lines + [""]
+        body += [f"🙏 Thank you for shopping with <b>{esc(s['brand'])}</b>!",
+                 "Your content is ready — enjoy 👇"]
+        head = pe("\n".join(body))
+
         links = []
         if it["link"]:
-            links.append(ubtn("Open link", None, it["link"], icon="👅", style="primary"))
+            links.append(ubtn(f"Open link{price_tag}", None, it["link"], icon="⬇️", style="success"))
         if it["channel_link"]:
-            links.append(ubtn("Join channel", None, it["channel_link"], icon="👅", style="success"))
+            links.append(ubtn(f"Join channel{price_tag}", None, it["channel_link"], icon="⬇️", style="success"))
         if it["group_link"]:
-            links.append(ubtn("Join group", None, it["group_link"], icon="👅", style="success"))
+            links.append(ubtn(f"Join group{price_tag}", None, it["group_link"], icon="⬇️", style="success"))
         link_rows = [links[i:i + 2] for i in range(0, len(links), 2)]
         footer = rows([ubtn("My library", "library", icon="🍒", style="primary"),
                        ubtn("Buy something else", "shop:0", icon="🍆", style="success")])
         if it["file_id"]:
             r = self.bot.send_media(chat, it["file_kind"] or it["kind"], it["file_id"],
-                                    caption=head + "\n\n📦 Your download is attached to this message.",
+                                    caption=head + "\n\n📦 <i>Your file is attached to this message.</i>",
                                     kbd=link_rows + footer)
             if r and not r.get("ok") and not self.bot.offline:
                 for a in ADMIN_IDS:
@@ -1402,8 +2121,8 @@ class PremiumBot:
         else:
             self.bot.send(chat, head, kbd=link_rows + footer)
         if order:
-            x("UPDATE orders SET delivered=1 WHERE id=?", (int(order["id"]),))
-            x("UPDATE items SET sold=sold+1 WHERE id=?", (int(it["id"]),))
+            STORE.order_delivered(int(order["id"]))
+            STORE.item_inc_sold(int(it["id"]))
         return True
 
     # ======================================================================
@@ -1411,16 +2130,17 @@ class PremiumBot:
     # ======================================================================
     def notify_admin(self, order, it, urow):
         body = ["🔔 <b>New payment submitted</b>", SEP,
-                f"Order: <b>#{order['no']}</b>",
-                f"Customer: {esc(urow['name'])} {esc(urow['username'] or '')} · tg <code>{urow['tg_id']}</code>",
-                f"Item: {esc(shorten(it['title'], 40))} <code>#{it['id']}</code>",
-                f"Amount: <b>{money(order['amount'])}</b> · {ts(order['created_at'])}",
-                (f"Note: {esc(order['note'])}" if order["note"] else ""),
+                f"🧾 Order: <b>#{order['no']}</b>",
+                f"👤 Customer: {esc(urow['name'])} {esc(urow['username'] or '')} · tg <code>{urow['tg_id']}</code>",
+                f"📦 Item: {esc(shorten(it['title'], 40))} <code>#{it['id']}</code>",
+                f"💳 Amount: <b>{money(order['amount'])}</b> · {ts(order['created_at'])}",
+                (f"📝 Note: {esc(order['note'])}" if order["note"] else ""),
                 ("" if all_settings()["upi_id"] else "⚠️ No UPI id configured — verify manually.")]
-        buttons = rows([btn("✅ Approve & deliver", f"aok:{order['id']}"),
-                        btn("❌ Decline", f"adcl:{order['id']}")],
-                       [btn("🧾 Order details", f"aord:{order['id']}"), btn("👤 User profile", f"ausr:{urow['id']}")],
-                       [btn("⏳ Pending queue", "pend")])
+        buttons = rows([ubtn("Approve & deliver", f"aok:{order['id']}", icon="✅", style="success"),
+                        ubtn("Decline", f"adcl:{order['id']}", icon="❌", style="danger")],
+                       [ubtn("Order details", f"aord:{order['id']}", icon="⬇️", style="primary"),
+                        ubtn("User profile", f"ausr:{urow['id']}", icon="👤", style="primary")],
+                       [ubtn("Pending queue", "pend", icon="🔋", style="primary")])
         for a in ADMIN_IDS:
             if order["proof_id"]:
                 self.bot.send_media(a, order["proof_kind"] or "photo", order["proof_id"],
@@ -1438,19 +2158,21 @@ class PremiumBot:
         if o["status"] == "approved":
             return self.bot.send(admin_chat,
                                  f"ℹ️ Order <b>#{o['no']}</b> is already approved.",
-                                 kb(rows([btn("🔁 Send again", f"adel:{o['id']}")], [btn("🧾 Order details", f"aord:{o['id']}")])))
+                                 kb(rows([ubtn("Send again", f"adel:{o['id']}", icon="⬇️", style="success")],
+                                         [ubtn("Order details", f"aord:{o['id']}", icon="⚙️", style="primary")])))
         if not (it and urow):
             return self.bot.send(admin_chat, "❌ Item or user is missing — cannot approve.")
-        x("UPDATE orders SET status='approved', decided_at=?, decided_by=?, reason=NULL WHERE id=?",
-          (now(), int(admin_chat), int(oid)))
-        x("UPDATE users SET spent=spent+? WHERE id=?", (float(o["amount"]), int(urow["id"])))
+        STORE.order_update(int(oid), status="approved", decided_at=now(),
+                           decided_by=int(admin_chat), reason=None)
+        STORE.user_add_spent(int(urow["id"]), float(o["amount"]))
         grant_access(urow["id"], it["id"], o["id"], it["validity_days"])
         if not silent:
             self.bot.send(admin_chat,
-                          f"✅ <b>Approved #{o['no']}</b>\n{SEP}\n{esc(it['title'])} → {esc(urow['name'])}\n"
-                          f"{money(o['amount'])} added to revenue.",
-                          kb(rows([btn("⏳ Pending queue", "pend"), btn("📊 Stats", "stats")],
-                                  [btn("🛠 Admin panel", "admin")])))
+                          pe(f"✅ <b>Approved #{o['no']}</b>\n{SEP}\n📦 {esc(it['title'])} → 👤 {esc(urow['name'])}\n"
+                             f"💰 {money(o['amount'])} added to revenue."),
+                          kb(rows([ubtn("Pending queue", "pend", icon="🔋", style="primary"),
+                                   btn("📊 Stats", "stats", style="primary")],
+                                  [ubtn("Admin panel", "admin", icon="⚙️", style="primary")])))
         return self.deliver(urow["id"], it, get_order(oid))
 
     def decline_order(self, admin_chat, oid, reason=""):
@@ -1458,20 +2180,22 @@ class PremiumBot:
         if not o:
             return self.bot.send(admin_chat, "❌ Order not found.")
         reason = (reason or "Payment could not be verified.").strip()
-        x("UPDATE orders SET status='declined', decided_at=?, decided_by=?, reason=? WHERE id=?",
-          (now(), int(admin_chat), reason, int(oid)))
+        STORE.order_update(int(oid), status="declined", decided_at=now(),
+                           decided_by=int(admin_chat), reason=reason)
         urow = user_by_id(o["user_id"])
         if urow:
             set_state(int(urow["tg_id"]), {})
             self.bot.send(int(urow["tg_id"]),
-                          f"❌ <b>Order #{o['no']} was not approved</b>\n{SEP}\nReason: {esc(reason)}\n\n"
-                          "You can send the correct proof or order again.",
-                          kb(rows([btn("📤 Re-send screenshot", f"ready:{o['id']}"),
-                                    btn("🛍 Try again", f"buy:{o['item_id']}")],
-                                  [btn("💬 Message admin", "contact_admin")])))
+                          pe(f"❌ <b>Order #{o['no']} was not approved</b>\n{SEP}\n"
+                             f"📝 Reason: {esc(reason)}\n\n"
+                             "You can send the correct proof or order again."),
+                          kb(rows([btn("📤 Re-send screenshot", f"ready:{o['id']}", style="success"),
+                                    btn("🛍 Try again", f"buy:{o['item_id']}", style="primary")],
+                                  [btn("💬 Message admin", "contact_admin", style="primary")])))
         self.bot.send(admin_chat,
                       f"❌ <b>Declined #{o['no']}</b>\n{SEP}\n{esc(o['note'] or '')}\nReason sent to the user.",
-                      kb(rows([btn("⏳ Pending queue", "pend")], [btn("🛠 Admin panel", "admin")])))
+                      kb(rows([ubtn("Pending queue", "pend", icon="🔋", style="primary")],
+                              [ubtn("Admin panel", "admin", icon="⚙️", style="primary")])))
         return True
 
     # ======================================================================
@@ -1479,10 +2203,10 @@ class PremiumBot:
     # ======================================================================
     def admin_panel(self, chat_id):
         s = all_settings()
-        live = q("SELECT COUNT(*) c FROM items WHERE active=1")[0]["c"]
-        pend = q("SELECT COUNT(*) c FROM orders WHERE status='pending'")[0]["c"]
-        rev = q("SELECT COALESCE(SUM(amount),0) s FROM orders WHERE status='approved'")[0]["s"]
-        users = q("SELECT COUNT(*) c FROM users WHERE is_admin=0")[0]["c"]
+        live = STORE.count_active_items()
+        pend = STORE.count_orders("pending")
+        rev = STORE.sum_orders("approved")[1]
+        users = STORE.count_customers()
         body = [f"🛠 <b>{esc(s['brand'])} — admin panel</b>", SEP,
                 f"📦 Live items: <b>{live}</b>",
                 f"⏳ Waiting approval: <b>{pend}</b>" + ("  ← action needed" if pend else ""),
@@ -1492,19 +2216,24 @@ class PremiumBot:
                 f"🖼 Welcome photo: {'set' if s['welcome_photo_id'] else 'not set'}  ·  📢 Force join: "
                 f"{esc(s['force_channel'] or 'off')}", ""]
         buttons = rows(
-            [btn(f"📦 Items ({live})", "pg:items:0"), btn("➕ New item", "newitem")],
-            [btn(f"⏳ Approvals ({pend})", "pend"), btn("🧾 All orders", "pg:orders:0")],
-            [btn("💳 Payment setup", "pg:pay"), btn("🏪 Store settings", "pg:store")],
-            [btn("📊 Sales report", "stats"), btn("👥 Customers", "pg:users")],
-            [btn("📣 Broadcast", "bcast"), btn("ⓘ Commands", "pg:help")])
-        self.bot.send(chat_id, "\n".join(body), kb(buttons))
+            [ubtn(f"Items ({live})", "pg:items:0", icon="📦", style="primary"),
+             ubtn("New item", "newitem", icon="➕", style="success")],
+            [ubtn(f"Approvals ({pend})", "pend", icon="✅", style="success"),
+             ubtn("All orders", "pg:orders:0", icon="⬇️", style="primary")],
+            [ubtn("Payment setup", "pg:pay", icon="💳", style="primary"),
+             ubtn("Store settings", "pg:store", icon="⚙️", style="primary")],
+            [ubtn("Sales report", "stats", icon="📊", style="primary"),
+             ubtn("Customers", "pg:users", icon="👥", style="primary")],
+            [ubtn("Broadcast", "bcast", icon="📣", style="primary"),
+             ubtn("Commands", "pg:help", icon="⚙️", style="primary")])
+        self.bot.send(chat_id, pe("\n".join(body)), kb(buttons))
 
     def admin_settings(self, chat_id):
         return self.bot.send(chat_id,
                              "⚙️ What would you like to configure?",
-                             kb(rows([btn("💳 Payment (UPI / QR)", "pg:pay")],
-                                     [btn("🏪 Store & welcome", "pg:store")],
-                                     [btn("🛠 Full panel", "admin")])))
+                             kb(rows([ubtn("Payment (UPI / QR)", "pg:pay", icon="💳", style="primary")],
+                                     [ubtn("Store & welcome", "pg:store", icon="⚙️", style="primary")],
+                                     [ubtn("Full panel", "admin", icon="🛠", style="success")])))
 
     # ------------------------------ payment setup -------------------------
     def admin_pay_setup(self, chat_id, page=0):
@@ -1517,12 +2246,16 @@ class PremiumBot:
                 f"<b>Refund note</b>\n{esc(s['refund_note'])}",
                 (f"\n<b>Extra instructions</b>\n{esc(s['pay_instructions'])}" if s["pay_instructions"] else "")]
         buttons = rows(
-            [btn("✏️ UPI ID", "s:upi_id"), btn("👤 Payee name", "s:payee_name")],
-            [btn("🖼 Upload QR", "setqr"), btn("🗑 Remove QR", "delqr")],
-            [btn("📝 Checkout note", "s:pay_note"), btn("📜 Refund note", "s:refund_note")],
-            [btn("➕ Extra instructions", "s:pay_instructions")],
-            [btn("👁 Preview checkout", "pg:preview"), btn("🔙 Back", "admin")])
-        self.bot.send(chat_id, "\n".join(body), kb(buttons))
+            [ubtn("UPI ID", "s:upi_id", icon="💳", style="primary"),
+             ubtn("Payee name", "s:payee_name", icon="👤", style="primary")],
+            [ubtn("Upload QR", "setqr", icon="🖼", style="success"),
+             ubtn("Remove QR", "delqr", icon="🗑", style="danger")],
+            [btn("📝 Checkout note", "s:pay_note", style="primary"),
+             btn("📜 Refund note", "s:refund_note", style="primary")],
+            [btn("➕ Extra instructions", "s:pay_instructions", style="primary")],
+            [ubtn("Preview checkout", "pg:preview", icon="⬇️", style="success"),
+             ubtn("Back", "admin", icon="⚙️", style="primary")])
+        self.bot.send(chat_id, pe("\n".join(body)), kb(buttons))
 
     def admin_store_setup(self, chat_id):
         s = all_settings()
@@ -1543,27 +2276,36 @@ class PremiumBot:
                 f"today <code>{esc(s['stats_today'] or 'auto')}</code>",
                 "", "<i>The welcome screen is what a user sees on /start.</i>"]
         buttons = rows(
-            [btn("🏷 Brand name", "s:brand"), btn("👋 Welcome text", "s:welcome_text")],
-            [btn("🖼 Set welcome photo", "setwelcomephoto"), btn("🗑 Remove photo", "delwelcomephoto")],
-            [btn("📢 Force channel join", "s:force_channel"), btn("📦 Empty-store note", "s:out_of_stock_note")],
-            [btn("📹 Free demo link", "s:demo_link"), btn("📢 Proofs channel", "s:proofs_link")],
-            [btn("🚨 Support link", "s:support_link")],
-            [btn("👥 Stats joined", "s:stats_joined"), btn("🔥 Stats month", "s:stats_month"),
-             btn("⚡ Stats today", "s:stats_today")],
-            [btn("👁 Preview welcome", "pg:previewwelcome"), btn("🔙 Back", "admin")])
-        self.bot.send(chat_id, "\n".join(body), kb(buttons))
+            [ubtn("Brand name", "s:brand", icon="©", style="primary"),
+             btn("👋 Welcome text", "s:welcome_text", style="primary")],
+            [ubtn("Set welcome photo", "setwelcomephoto", icon="🖼", style="success"),
+             ubtn("Remove photo", "delwelcomephoto", icon="🗑", style="danger")],
+            [ubtn("Force channel join", "s:force_channel", icon="🛡", style="primary"),
+             ubtn("Empty-store note", "s:out_of_stock_note", icon="📦", style="primary")],
+            [btn("📹 Free demo link", "s:demo_link", style="primary"),
+             ubtn("Proofs channel", "s:proofs_link", icon="📢", style="primary")],
+            [btn("🚨 Support link", "s:support_link", style="primary")],
+            [ubtn("Stats joined", "s:stats_joined", icon="👥", style="primary"),
+             btn("🔥 Stats month", "s:stats_month", style="primary"),
+             btn("⚡ Stats today", "s:stats_today", style="primary")])
+        if s["welcome_text"]:
+            buttons.append([ubtn("Reset welcome to default", "rstdfl:welcome_text", icon="🔄", style="danger")])
+        buttons.append([ubtn("Preview welcome", "pg:previewwelcome", icon="⬇️", style="success"),
+                        ubtn("Back", "admin", icon="⚙️", style="primary")])
+        self.bot.send(chat_id, pe("\n".join(body)), kb(buttons))
 
     # ------------------------------ items management ----------------------
     def admin_items(self, chat_id, page=0):
-        allitems = q("SELECT * FROM items ORDER BY id DESC LIMIT 300")
+        allitems = STORE.items_all_desc(300)
         total = len(allitems)
         pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
         page = max(0, min(int(page), pages - 1))
         chunk = allitems[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
         if not chunk:
             return self.bot.send(chat_id,
-                                 "📦 <b>No items yet</b>\n" + SEP + "\nCreate the first one with the button below.",
-                                 kb(rows([btn("➕ New item", "newitem")], [btn("🛠 Admin panel", "admin")])))
+                                 pe("📦 <b>No items yet</b>\n" + SEP + "\nCreate the first one with the button below."),
+                                 kb(rows([ubtn("New item", "newitem", icon="📦", style="success")],
+                                         [ubtn("Admin panel", "admin", icon="⚙️", style="primary")])))
         lines, buttons = [], []
         for it in chunk:
             state = "🟢" if it["active"] else "⏸️"
@@ -1572,19 +2314,20 @@ class PremiumBot:
                      "♾" if not it["validity_days"] else f"{it['validity_days']}d",
                      f"🛒 {it['sold']}"]
             lines.append(" · ".join(parts))
-            buttons.append([btn(f"⚙️ #{it['id']} {shorten(it['title'], 22)}", f"adm:{it['id']}")])
+            buttons.append([ubtn(f"#{it['id']} {shorten(it['title'], 22)}", f"adm:{it['id']}",
+                                 icon="⚙️", style="primary")])
         nav = []
         if page > 0:
-            nav.append(btn("◀️ Prev", f"pg:items:{page - 1}"))
+            nav.append(btn("◀️ Prev", f"pg:items:{page - 1}", style="primary"))
         if page < pages - 1:
-            nav.append(btn("Next ▶️", f"pg:items:{page + 1}"))
-        nav.append(btn("➕ New item", "newitem"))
+            nav.append(btn("Next ▶️", f"pg:items:{page + 1}", style="primary"))
+        nav.append(ubtn("New item", "newitem", icon="➕", style="success"))
         buttons.append(nav)
-        buttons.append([btn("🛠 Admin panel", "admin")])
+        buttons.append([ubtn("Admin panel", "admin", icon="⚙️", style="primary")])
         live = len([i for i in allitems if i["active"]])
         self.bot.send(chat_id,
-                      f"📦 <b>Items</b> — {total} total · {live} live\n{SEP}\n\n" + "\n".join(lines) +
-                      (f"\n\nPage {page + 1}/{pages}" if pages > 1 else ""),
+                      pe(f"📦 <b>Items</b> — {total} total · {live} live\n{SEP}\n\n" + "\n".join(lines) +
+                         (f"\n\nPage {page + 1}/{pages}" if pages > 1 else "")),
                       kb(buttons))
 
     def item_menu(self, chat_id, it):
@@ -1595,27 +2338,31 @@ class PremiumBot:
         body = [self.item_caption(it), SEP, "🧩 " + " · ".join(flags),
                 f"🆔 Item id: <code>{it['id']}</code>  ·  updated {ts(it['updated_at'])}"]
         buttons = rows(
-            [btn("✏️ Title", f"f:title:{it['id']}"), btn("📝 Description", f"f:descr:{it['id']}")],
-            [btn("💵 Price", f"f:price:{it['id']}"), btn("⏱ Validity", f"f:validity_days:{it['id']}")],
-            [btn("🎬 Replace file", f"f:file_id:{it['id']}"), btn("🗑 Remove file", f"nofile:{it['id']}")],
-            [btn("🔗 Main link", f"f:link:{it['id']}"), btn("📢 Channel link", f"f:channel_link:{it['id']}")],
-            [btn("👥 Group link", f"f:group_link:{it['id']}")],
-            [btn("🟢/⏸️ Publish / unpublish", f"tog:{it['id']}"), btn("🗑 Delete", f"del:{it['id']}")],
-            [btn("👁 Preview for me", f"prev:{it['id']}"), btn("👥 Who bought", f"buyers:{it['id']}")],
-            [btn("🔙 Items", "pg:items:0")])
-        self.bot.send(chat_id, "\n".join(body), kb(buttons))
+            [ubtn("Title", f"f:title:{it['id']}", icon="✏️", style="primary"),
+             ubtn("Description", f"f:descr:{it['id']}", icon="📝", style="primary")],
+            [ubtn("Price", f"f:price:{it['id']}", icon="💵", style="primary"),
+             ubtn("Validity", f"f:validity_days:{it['id']}", icon="♾", style="primary")],
+            [ubtn("Replace file", f"f:file_id:{it['id']}", icon="⬇️", style="primary"),
+             ubtn("Remove file", f"nofile:{it['id']}", icon="🗑", style="danger")],
+            [ubtn("Main link", f"f:link:{it['id']}", icon="🔗", style="primary"),
+             ubtn("Channel link", f"f:channel_link:{it['id']}", icon="📢", style="primary")],
+            [ubtn("Group link", f"f:group_link:{it['id']}", icon="👥", style="primary")],
+            [ubtn("Publish / unpublish", f"tog:{it['id']}", icon="🔋", style="success"),
+             ubtn("Delete", f"del:{it['id']}", icon="🗑", style="danger")],
+            [ubtn("Preview for me", f"prev:{it['id']}", icon="👁", style="primary"),
+             ubtn("Who bought", f"buyers:{it['id']}", icon="🫂", style="primary")],
+            [ubtn("Items", "pg:items:0", icon="📦", style="primary")])
+        self.bot.send(chat_id, pe("\n".join(body)), kb(buttons))
 
     # ------------------------------ orders management ---------------------
     def admin_orders(self, chat_id, page=0, only_pending=True):
-        where = "o.status='pending'" if only_pending else "1=1"
-        rows_ = q(f"""SELECT o.*, i.title, u.name, u.tg_id, u.username FROM orders o
-                      JOIN items i ON i.id=o.item_id JOIN users u ON u.id=o.user_id
-                      WHERE {where} ORDER BY o.id DESC LIMIT 60""")
+        rows_ = STORE.orders_admin_list(only_pending, 60)
         icon = {"pending": "⏳", "approved": "✅", "declined": "❌", "cancelled": "🗑"}
         if not rows_:
             return self.bot.send(chat_id,
                                  "🎉 <b>Nothing waiting</b>\n" + SEP + "\nEvery payment has been reviewed.",
-                                 kb(rows([btn("🧾 All orders", "pg:orders:0"), btn("🛠 Admin panel", "admin")])))
+                                 kb(rows([ubtn("All orders", "pg:orders:0", icon="⬇️", style="primary")],
+                                         [ubtn("Admin panel", "admin", icon="⚙️", style="primary")])))
         lines, buttons = [], []
         for r in rows_:
             tag = icon.get(r["status"], "•") if not only_pending else ("📸" if r["proof_id"] else "🚫 proof missing")
@@ -1623,22 +2370,23 @@ class PremiumBot:
             lines.append(f"{tag} <b>#{r['no']}</b> · {money(r['amount'])} · {esc(shorten(r['title'], 24))} {status}\n"
                          f"   👤 {esc(shorten(r['name'], 22))} {esc(r['username'] or '')} · {ts(r['created_at'])}")
             if only_pending:
-                buttons.append([btn(f"✅ Approve #{r['no']}", f"aok:{r['id']}"),
-                                btn(f"❌ Decline #{r['no']}", f"adcl:{r['id']}")])
+                buttons.append([ubtn(f"Approve #{r['no']}", f"aok:{r['id']}", icon="✅", style="success"),
+                                ubtn(f"Decline #{r['no']}", f"adcl:{r['id']}", icon="❌", style="danger")])
             else:
-                buttons.append([btn(f"🧾 #{r['no']} {r['status']}", f"aord:{r['id']}")])
+                buttons.append([btn(f"🧾 #{r['no']} {r['status']}", f"aord:{r['id']}", style="primary")])
         nav = []
         if page > 0:
-            nav.append(btn("◀️ Prev", f"pg:{'orders' if not only_pending else 'pend'}:{page - 1}"))
+            nav.append(btn("◀️ Prev", f"pg:{'orders' if not only_pending else 'pend'}:{page - 1}", style="primary"))
         if len(rows_) > PAGE_SIZE:
-            nav.append(btn("Next ▶️", f"pg:{'orders' if not only_pending else 'pend'}:{page + 1}"))
+            nav.append(btn("Next ▶️", f"pg:{'orders' if not only_pending else 'pend'}:{page + 1}", style="primary"))
         if only_pending:
-            nav.append(btn("✅ Approve all", "aall"))
+            nav.append(ubtn("Approve all", "aall", icon="✅", style="success"))
         buttons.append(nav) if nav else None
-        buttons.append([btn("📜 All orders" if only_pending else "⏳ Pending", "pg:pend:0" if not only_pending else "pg:orders:0"),
-                        btn("🛠 Admin panel", "admin")])
+        buttons.append([btn("📜 All orders" if only_pending else "⏳ Pending",
+                            "pg:pend:0" if not only_pending else "pg:orders:0", style="primary"),
+                        ubtn("Admin panel", "admin", icon="⚙️", style="primary")])
         head = "⏳ <b>Waiting for approval</b>" if only_pending else "🧾 <b>Recent orders</b>"
-        self.bot.send(chat_id, f"{head} — {len(rows_)}\n{SEP}\n\n" + "\n".join(lines[:20]), kb(buttons))
+        self.bot.send(chat_id, pe(f"{head} — {len(rows_)}\n{SEP}\n\n" + "\n".join(lines[:20])), kb(buttons))
 
     def order_view(self, chat_id, oid):
         o = get_order(oid)
@@ -1663,87 +2411,88 @@ class PremiumBot:
                 f"Payment proof: {'📸 attached' if o['proof_id'] else '🚫 none'}"]
         buttons = []
         if o["status"] == "pending":
-            buttons.append([btn("✅ Approve & deliver", f"aok:{o['id']}"), btn("❌ Decline", f"adcl:{o['id']}")])
+            buttons.append([ubtn("Approve & deliver", f"aok:{o['id']}", icon="✅", style="success"),
+                            btn("❌ Decline", f"adcl:{o['id']}", style="danger")])
         if o["proof_id"]:
-            buttons.append([btn("🖼 View screenshot", f"aproof:{o['id']}")])
+            buttons.append([ubtn("View screenshot", f"aproof:{o['id']}", icon="📸", style="primary")])
         if o["status"] in ("approved", "declined"):
-            buttons.append([btn("🔁 Re-deliver content", f"adel:{o['id']}"),
-                            btn("↩️ Set back to pending", f"areopen:{o['id']}")])
-        buttons.append([btn("👤 Customer profile", f"ausr:{u['id']}"),
-                        btn("🛠 Open item", f"adm:{it['id']}")])
-        buttons.append([btn("🔙 Approvals", "pend")])
-        self.bot.send(chat_id, "\n".join([l for l in body if l]), kb(buttons))
+            buttons.append([ubtn("Re-deliver content", f"adel:{o['id']}", icon="🔁", style="success"),
+                            ubtn("Set back to pending", f"areopen:{o['id']}", icon="↩️", style="primary")])
+        buttons.append([ubtn("Customer profile", f"ausr:{u['id']}", icon="👤", style="primary"),
+                        ubtn("Open item", f"adm:{it['id']}", icon="⚙️", style="primary")])
+        buttons.append([ubtn("Approvals", "pend", icon="✅", style="primary")])
+        self.bot.send(chat_id, pe("\n".join([l for l in body if l])), kb(buttons))
         if o["proof_id"]:
             self.bot.send_media(chat_id, o["proof_kind"] or "photo", o["proof_id"],
                                 caption=f"📸 Payment screenshot · order #{o['no']}")
 
     # ------------------------------ users / stats -------------------------
     def admin_users(self, chat_id, page=0):
-        rows_ = q("SELECT * FROM users WHERE is_admin=0 ORDER BY spent DESC, id DESC LIMIT 30")
+        rows_ = STORE.customers_top(30)
         if not rows_:
             return self.bot.send(chat_id, "👥 No customers yet — they appear after the first /start.",
-                                 kb(rows([btn("🛠 Admin panel", "admin")])))
+                                 kb(rows([ubtn("Admin panel", "admin", icon="⚙️", style="primary")])))
         lines, buttons = [], []
         for r in rows_:
-            o1 = q("SELECT COUNT(*) c FROM orders WHERE user_id=? AND status='pending'", (r["id"],))[0]["c"]
+            o1 = STORE.count_orders("pending", user=r["id"])
             lines.append(f"▪️ <b>{esc(shorten(r['name'], 22))}</b> {esc(r['username'] or '')} · <code>{r['id']}</code>\n"
                          f"   💰 {money(r['spent'])} · 🧾 {r['orders']} orders"
                          + (f" · ⏳ {o1}" if o1 else "") + (" · 🚫 blocked" if r["blocked"] else ""))
-            buttons.append([btn(f"👤 {shorten(r['name'], 22)}", f"ausr:{r['id']}")])
-        buttons.append([btn("🛠 Admin panel", "admin")])
+            buttons.append([ubtn(shorten(r['name'], 22), f"ausr:{r['id']}", icon="👤", style="primary")])
+        buttons.append([ubtn("Admin panel", "admin", icon="⚙️", style="primary")])
         self.bot.send(chat_id,
-                      f"👥 <b>Customers</b> — {len(rows_)}\n{SEP}\n\n" + "\n".join(lines[:15]), kb(buttons))
+                      pe(f"👥 <b>Customers</b> — {len(rows_)}\n{SEP}\n\n" + "\n".join(lines[:15])), kb(buttons))
 
     def customer_view(self, chat_id, pk):
         u = user_by_id(pk) or user_by_tg(pk)
         if not u:
-            return self.bot.send(chat_id, "❌ Customer not found.", kb(rows([btn("🔙 Back", "pg:users:0")])))
-        o_all = q("SELECT COUNT(*) c FROM orders WHERE user_id=?", (u["id"],))[0]["c"]
-        o_pend = q("SELECT COUNT(*) c FROM orders WHERE user_id=? AND status='pending'", (u["id"],))[0]["c"]
-        o_ok = q("SELECT COUNT(*) c FROM orders WHERE user_id=? AND status='approved'", (u["id"],))[0]["c"]
-        items = q("SELECT COUNT(*) c FROM unlocks WHERE user_id=?", (u["id"],))[0]["c"]
+            return self.bot.send(chat_id, "❌ Customer not found.", kb(rows([btn("🔙 Back", "pg:users:0", style="primary")])))
+        o_all = STORE.count_orders(user=u["id"])
+        o_pend = STORE.count_orders("pending", user=u["id"])
+        o_ok = STORE.count_orders("approved", user=u["id"])
+        items = STORE.count_unlocks(u["id"])
         body = [f"👤 <b>{esc(u['name'])}</b> {esc(u['username'] or '')}", SEP,
                 f"Telegram ID: <code>{u['tg_id']}</code> · bot ID: <code>{u['id']}</code>",
                 f"Joined: {ts(u['created_at'])} · last seen: {ts(u['last_seen'])}",
                 f"💰 Spent: <b>{money(u['spent'])}</b>",
                 f"🧾 Orders: {o_all} (⏳ {o_pend} · ✅ {o_ok}) · 🔓 Unlocked: {items}",
                 f"🚫 Status: {'blocked' if u['blocked'] else 'active'}"]
-        buttons = rows([btn("🧾 Their orders", f"ausers:{u['id']}"), btn("🎁 Grant free access", f"agr:{u['id']}")],
-                       [btn("📣 Message them", f"apm:{u['id']}")],
-                       [btn(("🔓 Unblock" if u["blocked"] else "🚫 Block"),
-                            (f"aub:{u['id']}" if u["blocked"] else f"abl:{u['id']}"))],
-                       [btn("🔙 Customers", "pg:users:0")])
-        self.bot.send(chat_id, "\n".join(body), kb(buttons))
+        buttons = rows([ubtn("Their orders", f"ausers:{u['id']}", icon="⬇️", style="primary"),
+                        ubtn("Grant free access", f"agr:{u['id']}", icon="🎁", style="success")],
+                       [ubtn("Message them", f"apm:{u['id']}", icon="📣", style="primary")],
+                       [ubtn(("Unblock" if u["blocked"] else "Block"),
+                             (f"aub:{u['id']}" if u["blocked"] else f"abl:{u['id']}"),
+                             icon=("🔓" if u["blocked"] else "🚫"),
+                             style=("success" if u["blocked"] else "danger"))],
+                       [ubtn("Customers", "pg:users:0", icon="👤", style="primary")])
+        self.bot.send(chat_id, pe("\n".join(body)), kb(buttons))
 
     def customer_orders(self, chat_id, pk):
-        rows_ = q("""SELECT o.*, i.title FROM orders o JOIN items i ON i.id=o.item_id
-                     WHERE o.user_id=? ORDER BY o.id DESC LIMIT 20""", (int(pk),))
+        rows_ = STORE.orders_for_user(pk, 20)
         if not rows_:
-            return self.bot.send(chat_id, "This customer has no orders.", kb(rows([btn("🔙 Back", "pg:users:0")])))
+            return self.bot.send(chat_id, "This customer has no orders.",
+                                 kb(rows([btn("🔙 Back", "pg:users:0", style="primary")])))
         icon = {"pending": "⏳", "approved": "✅", "declined": "❌", "cancelled": "🗑"}
         lines = [f"{icon.get(r['status'], '•')} <b>#{r['no']}</b> · {money(r['amount'])} · "
                  f"{esc(shorten(r['title'], 22))} · {r['status']} · {ts(r['created_at'])}" for r in rows_]
-        buttons = [[btn(f"🧾 #{r['no']}", f"aord:{r['id']}")] for r in rows_[:8]]
-        buttons.append([btn("👤 Profile", f"ausr:{pk}"), btn("🔙 Customers", "pg:users:0")])
+        buttons = [[btn(f"🧾 #{r['no']}", f"aord:{r['id']}", style="primary")] for r in rows_[:8]]
+        buttons.append([ubtn("Profile", f"ausr:{pk}", icon="👤", style="primary"),
+                        ubtn("Customers", "pg:users:0", icon="👤", style="primary")])
         self.bot.send(chat_id, f"🧾 <b>Customer #{pk} orders</b>\n{SEP}\n\n" + "\n".join(lines), kb(buttons))
 
     def admin_stats(self, chat_id):
         s = all_settings()
-        a = q("SELECT COUNT(*) c, COALESCE(SUM(amount),0) s FROM orders WHERE status='approved'")[0]
-        p = q("SELECT COUNT(*) c, COALESCE(SUM(amount),0) s FROM orders WHERE status='pending'")[0]
-        d = q("SELECT COUNT(*) c FROM orders WHERE status='declined'")[0]["c"]
-        today = q("SELECT COUNT(*) c, COALESCE(SUM(amount),0) s FROM orders "
-                  "WHERE status='approved' AND decided_at>=?", (datetime.now().strftime("%Y-%m-%d"),))[0]
-        week = q("SELECT COUNT(*) c, COALESCE(SUM(amount),0) s FROM orders "
-                 "WHERE status='approved' AND decided_at>=?",
-                 ((datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d"),))[0]
-        top = q("""SELECT i.id, i.title, COUNT(*) c, SUM(o.amount) s FROM orders o JOIN items i ON i.id=o.item_id
-                   WHERE o.status='approved' GROUP BY i.id ORDER BY s DESC LIMIT 5""")
+        a_c, a_s = STORE.sum_orders("approved")
+        p_c, p_s = STORE.sum_orders("pending")
+        d = STORE.count_orders("declined")
+        t_c, t_s = STORE.sum_approved_since(datetime.now().strftime("%Y-%m-%d"))
+        w_c, w_s = STORE.sum_approved_since((datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d"))
+        top = STORE.best_sellers(5)
         body = [f"📊 <b>{esc(s['brand'])} — report</b>", SEP,
-                f"💰 Total revenue: <b>{money(a['s'])}</b>  ({a['c']} approved orders)",
-                f"📅 Today: <b>{money(today['s'])}</b> ({today['c']} orders)",
-                f"🗓 Last 7 days: <b>{money(week['s'])}</b> ({week['c']} orders)",
-                f"⏳ Waiting: {p['c']} orders · {money(p['s'])}",
+                f"💰 Total revenue: <b>{money(a_s)}</b>  ({a_c} approved orders)",
+                f"📅 Today: <b>{money(t_s)}</b> ({t_c} orders)",
+                f"🗓 Last 7 days: <b>{money(w_s)}</b> ({w_c} orders)",
+                f"⏳ Waiting: {p_c} orders · {money(p_s)}",
                 f"❌ Declined: {d}", "",
                 "<b>Best sellers</b>"]
         if top:
@@ -1751,8 +2500,10 @@ class PremiumBot:
         else:
             body += ["No sales yet."]
         self.bot.send(chat_id, "\n".join(body),
-                      kb(rows([btn("⏳ Approvals", "pend"), btn("🧾 All orders", "pg:orders:0")],
-                              [btn("👥 Customers", "pg:users:0"), btn("🛠 Admin panel", "admin")])))
+                      kb(rows([ubtn("Approvals", "pend", icon="✅", style="success"),
+                               ubtn("All orders", "pg:orders:0", icon="⬇️", style="primary")],
+                              [ubtn("Customers", "pg:users:0", icon="👤", style="primary"),
+                               ubtn("Admin panel", "admin", icon="⚙️", style="primary")])))
 
     # ======================================================================
     # ADMIN: text commands (power users — the panel buttons do the same)
@@ -1763,8 +2514,9 @@ class PremiumBot:
             it = self.find_item(arg)
             if not it:
                 return self.bot.send(chat_id, "Usage: <code>/del 3</code>")
-            x("DELETE FROM items WHERE id=?", (int(it["id"]),))
-            return self.bot.send(chat_id, f"🗑 Item #{it['id']} deleted.", kb(rows([btn("📦 Items", "pg:items:0")])))
+            STORE.item_delete(int(it["id"]))
+            return self.bot.send(chat_id, f"🗑 Item #{it['id']} deleted.",
+                                 kb(rows([ubtn("Items", "pg:items:0", icon="📦", style="primary")])))
         if c == "/edit":
             it = self.find_item(arg)
             return self.item_menu(chat_id, it) if it else self.bot.send(chat_id, "Usage: <code>/edit 3</code>")
@@ -1784,28 +2536,28 @@ class PremiumBot:
             return self.bot.send(chat_id, f"{'⏸️ Hidden' if c == '/pause' else '🟢 Published'}: {esc(it['title'])}")
         if c == "/grant":
             mt = re.match(r"(\d+)\s+#?(\d+)", arg or "")
-            u = q("SELECT * FROM users WHERE id=? OR tg_id=?", (int(mt.group(1)), int(mt.group(1)))) if mt else []
+            u = STORE.user_find(int(mt.group(1))) if mt else None
             it = get_item(int(mt.group(2))) if mt else None
             if not (u and it):
                 return self.bot.send(chat_id, "Usage: <code>/grant 5 3</code> → bot user 5 gets item 3 free")
-            grant_access(u[0]["id"], it["id"], None, it["validity_days"])
-            self.deliver(u[0]["id"], it, None)
-            return self.bot.send(chat_id, f"🎁 {esc(it['title'])} granted to {esc(u[0]['name'])}.")
+            grant_access(u["id"], it["id"], None, it["validity_days"])
+            self.deliver(u["id"], it, None)
+            return self.bot.send(chat_id, f"🎁 {esc(it['title'])} granted to {esc(u['name'])}.")
         if c == "/revoke":
             mt = re.match(r"(\d+)\s+#?(\d+)", arg or "")
             if not mt:
                 return self.bot.send(chat_id, "Usage: <code>/revoke 5 3</code>")
-            u = q("SELECT id FROM users WHERE id=? OR tg_id=?", (int(mt.group(1)), int(mt.group(1))))
+            u = STORE.user_find(int(mt.group(1)))
             if u:
-                x("DELETE FROM unlocks WHERE user_id=? AND item_id=?", (u[0]["id"], int(mt.group(2))))
+                STORE.unlock_delete(u["id"], int(mt.group(2)))
             return self.bot.send(chat_id, "🔒 Access revoked.")
         if c in ("/block", "/unblock"):
             t = re.sub(r"\D", "", arg or "")
-            u = q("SELECT * FROM users WHERE tg_id=? OR id=?", (int(t or 0), int(t or 0)))
+            u = STORE.user_find(int(t or 0))
             if not u:
                 return self.bot.send(chat_id, "Usage: <code>/block 123456</code> (telegram or bot id)")
-            x("UPDATE users SET blocked=? WHERE id=?", (1 if c == "/block" else 0, u[0]["id"]))
-            return self.bot.send(chat_id, f"{'🚫 Blocked' if c == '/block' else '🔓 Unblocked'} {esc(u[0]['name'])}.")
+            STORE.user_set_blocked(u["id"], c == "/block")
+            return self.bot.send(chat_id, f"{'🚫 Blocked' if c == '/block' else '🔓 Unblocked'} {esc(u['name'])}.")
         if c == "/approve":
             n = re.search(r"\d+", arg or "")
             return self.approve_order(chat_id, int(n.group())) if n else self.bot.send(chat_id, "Usage: <code>/approve 12</code>")
@@ -1850,10 +2602,14 @@ class PremiumBot:
                                  "Or send <code>/skip</code> for a link-only item.",
                                  kb(rows([btn("⏭️ Skip file", "wiz:skip:media"), btn("❌ Cancel", "cancel_flow")])))
         kind = media["kind"] if media else "link"
+        # the caption starts with the /add command itself — only text on the
+        # following lines (if any) is a real description
+        cap = (m.get("caption") or "")
+        cap = "\n".join(cap.split("\n")[1:]).strip()
         it_id = add_item(kind=kind, title=(title or (media or {}).get("name") or "New item")[:120],
                          price=price if price is not None else 0,
                          file_id=(media or {}).get("file_id"), file_kind=(media or {}).get("file_kind"),
-                         link=link, descr=(m.get("caption") or "")[:600])
+                         link=link, descr=cap[:600])
         it = get_item(it_id)
         self.bot.send(chat_id,
                       f"✅ Item <b>#{it_id}</b> created.\n{SEP}\n{self.item_caption(it)}",
@@ -1879,16 +2635,16 @@ class PremiumBot:
         """Simple add-item flow — first ask WHAT to add (button menu)."""
         set_state(tg_id, {"flow": "add", "step": "wtype", "d": {}})
         return self.bot.send(chat_id,
-                             "➕ <b>New item</b>\n" + SEP +
-                             "\nWhat do you want to add? Pick the type below.",
-                             kb(rows([btn("🎬 Video", "wtype:video", style="primary"),
-                                      btn("🖼 Photo", "wtype:photo", style="primary")],
-                                     [btn("📄 File", "wtype:file", style="primary"),
-                                      btn("🔗 Website link", "wtype:link", style="primary")],
-                                     [btn("📢 Channel link", "wtype:channel", style="primary"),
-                                      btn("👥 Group link", "wtype:group", style="primary")],
-                                     [btn("📝 Text / Coupon", "wtype:text", style="primary")],
-                                     [btn("❌ Cancel", "cancel_flow", style="danger")])))
+                             pe("➕ <b>New item</b>\n" + SEP +
+                                "\nWhat do you want to add? Pick the type below."),
+                             kb(rows([ubtn("Video", "wtype:video", icon="🎥", style="primary"),
+                                      ubtn("Photo", "wtype:photo", icon="🖼", style="primary")],
+                                     [ubtn("File", "wtype:file", icon="📦", style="primary"),
+                                      ubtn("Website link", "wtype:link", icon="🔗", style="primary")],
+                                     [ubtn("Channel link", "wtype:channel", icon="📢", style="primary"),
+                                      ubtn("Group link", "wtype:group", icon="👥", style="primary")],
+                                     [ubtn("Text / Coupon", "wtype:text", icon="📝", style="primary")],
+                                     [ubtn("Cancel", "cancel_flow", icon="❌", style="danger")])))
 
     def q_ask_content(self, chat_id, tg_id, d):
         """Step 3/3 of the simple wizard — ask for the actual content by type."""
@@ -2121,15 +2877,15 @@ class PremiumBot:
             return self.admin_stats(chat_id)
         if data == "bcast":
             set_state(tg_id, {"flow": "bc", "step": "text", "d": {}})
-            n = q("SELECT COUNT(*) c FROM users WHERE is_admin=0 AND blocked=0")[0]["c"]
+            n = len(STORE.broadcast_tg_ids())
             return self.bot.send(chat_id, f"📣 <b>Broadcast to {n} customers</b>\n\nType the message now "
                                           "(image or file works too). Send <code>/cancel</code> to abort.",
                                  kb(rows([btn("❌ Cancel", "cancel_flow")])))
         if data == "pg:preview":
-            it = q("SELECT * FROM items WHERE active=1 ORDER BY id DESC LIMIT 1")
+            it = STORE.item_any_active()
             if not it:
                 return self.bot.send(chat_id, "Create an item first to see the checkout screen.")
-            return self.payment_screen(chat_id, uid, None, it[0], note="👁 <b>Preview</b> — this is what the buyer sees.")
+            return self.payment_screen(chat_id, uid, None, it, note="👁 <b>Preview</b> — this is what the buyer sees.")
         if data == "pg:previewwelcome":
             return self.send_welcome(chat_id, uid)
         if data == "setqr":
@@ -2191,6 +2947,12 @@ class PremiumBot:
                     return self.wizard(chat_id, tg_id, {"flow": "add", "step": "media", "d": d}, "/skip", None)
                 return self.wizard(chat_id, tg_id, {"flow": "add", "step": step, "d": d}, "/skip", None)
             return self.wizard_start(chat_id, tg_id)
+        if data.startswith("rstdfl:"):
+            key = data[7:]
+            set_setting(key, "")
+            set_state(tg_id, {})
+            self.bot.send(chat_id, "🔄 <b>Reset to default</b> — the built-in welcome message is active again.")
+            return (self.admin_store_setup(chat_id) or True)
         if data.startswith("clr:"):
             return self.clear_setting(chat_id, tg_id, data[4:])
         if data.startswith("clritem:"):
@@ -2241,7 +3003,7 @@ class PremiumBot:
         if data.startswith("delyes:"):
             it = get_item(int(data[7:]))
             if it:
-                x("DELETE FROM items WHERE id=?", (int(it["id"]),))
+                STORE.item_delete(int(it["id"]))
                 self.bot.send(chat_id, f"🗑 <b>{esc(it['title'])}</b> deleted.")
             return self.admin_items(chat_id)
         if data.startswith("nofile:"):
@@ -2260,15 +3022,14 @@ class PremiumBot:
             return self.bot.send(chat_id, self.item_caption(it), kb(rows([btn("⚙️ Edit", f"adm:{it['id']}")])))
         if data.startswith("buyers:"):
             iid = int(data[7:])
-            rows_ = q("""SELECT o.amount, o.decided_at, u.name, u.id FROM orders o JOIN users u ON u.id=o.user_id
-                         WHERE o.item_id=? AND o.status='approved' ORDER BY o.id DESC LIMIT 20""", (iid,))
+            rows_ = STORE.buyers_of_item(iid, 20)
             if not rows_:
                 return self.bot.send(chat_id, "Nobody has bought this item yet.",
-                                     kb(rows([btn("🔙 Item", f"adm:{iid}")])))
+                                     kb(rows([ubtn("Item", f"adm:{iid}", icon="⚙️", style="primary")])))
             lines = [f"▪️ {esc(shorten(r['name'], 24))} · {money(r['amount'])} · {ts(r['decided_at'])}" for r in rows_]
-            buttons = [[btn(f"👤 {shorten(r['name'], 20)}", f"ausr:{r['id']}")] for r in rows_[:8]]
-            buttons.append([btn("🔙 Item", f"adm:{iid}")])
-            return self.bot.send(chat_id, f"🛒 <b>{len(rows_)} buyers</b>\n{SEP}\n\n" + "\n".join(lines), kb(buttons))
+            buttons = [[ubtn(shorten(r['name'], 20), f"ausr:{r['id']}", icon="👤", style="primary")] for r in rows_[:8]]
+            buttons.append([ubtn("Item", f"adm:{iid}", icon="⚙️", style="primary")])
+            return self.bot.send(chat_id, pe(f"🛒 <b>{len(rows_)} buyers</b>\n{SEP}\n\n" + "\n".join(lines)), kb(buttons))
         # ------------------------- order actions -------------------------
         if data.startswith("aok:"):
             return self.approve_order(chat_id, int(data[4:]))
@@ -2294,7 +3055,7 @@ class PremiumBot:
             return self.bot.send(chat_id, "❌ Could not re-deliver.")
         if data.startswith("areopen:"):
             oid = int(data[8:])
-            x("UPDATE orders SET status='pending', decided_at=NULL, reason=NULL WHERE id=?", (oid,))
+            STORE.order_reopen(oid)
             self.bot.send(chat_id, "↩️ Order moved back to pending.")
             return self.order_view(chat_id, oid)
         if data.startswith("aproof:"):
@@ -2315,29 +3076,33 @@ class PremiumBot:
             set_state(tg_id, {"flow": "pm", "step": "text", "d": {"user": int(data[4:])}})
             return self.bot.send(chat_id, "✍️ Type the message to send to this customer:")
         if data.startswith("abl:"):
-            x("UPDATE users SET blocked=1 WHERE id=?", (int(data[4:]),))
+            STORE.user_set_blocked(int(data[4:]), True)
             self.bot.send(chat_id, "🚫 Customer blocked.")
             return self.customer_view(chat_id, int(data[4:]))
         if data.startswith("aub:"):
-            x("UPDATE users SET blocked=0 WHERE id=?", (int(data[4:]),))
+            STORE.user_set_blocked(int(data[4:]), False)
             self.bot.send(chat_id, "🔓 Customer unblocked.")
             return self.customer_view(chat_id, int(data[4:]))
         if data == "aall":
-            n = q("SELECT COUNT(*) c FROM orders WHERE status='pending'")[0]["c"]
+            n = STORE.count_orders("pending")
             if not n:
-                return self.bot.send(chat_id, "Nothing is pending 🙂", kb(rows([btn("🛠 Admin panel", "admin")])))
+                return self.bot.send(chat_id, "Nothing is pending 🙂",
+                                     kb(rows([ubtn("Admin panel", "admin", icon="⚙️", style="primary")])))
             return self.bot.send(chat_id,
                                  f"⚠️ Approve <b>{n}</b> order(s) and deliver everything?\n"
                                  "Please check the screenshots first.",
-                                 kb(rows([btn(f"✅ Yes, approve {n}", "aall2"), btn("↩️ Cancel", "pend")])))
+                                 kb(rows([ubtn(f"Yes, approve {n}", "aall2", icon="✅", style="success"),
+                                          btn("↩️ Cancel", "pend", style="primary")])))
         if data == "aall2":
-            rows_ = q("SELECT id FROM orders WHERE status='pending' ORDER BY id")
-            for r in rows_:
-                self.approve_order(chat_id, r["id"], silent=True)
-            self.bot.send(chat_id, f"✅ {len(rows_)} order(s) approved and delivered.",
-                          kb(rows([btn("📊 Stats", "stats"), btn("🛠 Admin panel", "admin")])))
+            ids = STORE.pending_ids()
+            for oid in ids:
+                self.approve_order(chat_id, oid, silent=True)
+            self.bot.send(chat_id, f"✅ {len(ids)} order(s) approved and delivered.",
+                          kb(rows([btn("📊 Stats", "stats", style="primary"),
+                                   ubtn("Admin panel", "admin", icon="⚙️", style="primary")])))
             return
-        return self.bot.send(chat_id, "❓ Unknown button.", kb(rows([btn("🛠 Admin panel", "admin")])))
+        return self.bot.send(chat_id, "❓ Unknown button.",
+                             kb(rows([ubtn("Admin panel", "admin", icon="⚙️", style="primary")])))
 
     def open_item(self, chat_id, uid, item_id):
         it = get_item(item_id)
@@ -2417,10 +3182,15 @@ class PremiumBot:
         label, hint = labels.get(key, (key, "Send the new value"))
         cur = setting(key)
         set_state(tg_id, {"flow": "setfield", "step": key, "d": {}})
+        btns = []
+        if key == "welcome_text":
+            btns.append([ubtn("Reset to default", "rstdfl:welcome_text", icon="🔄", style="danger")])
+        btns.append([ubtn("Clear value", f"clr:{key}", icon="🗑", style="danger"),
+                     ubtn("Cancel", "cancel_flow", icon="❌", style="primary")])
         return self.bot.send(chat_id,
                              f"✏️ <b>{esc(label)}</b>\n{SEP}\n{hint}"
                              f"\n\nCurrent value:\n<code>{esc(shorten(cur, 200)) if cur else '— empty —'}</code>",
-                             kb(rows([btn("🗑 Clear value", f"clr:{key}"), btn("❌ Cancel", "cancel_flow")])))
+                             kb(rows(*btns)))
 
     def start_item_edit(self, chat_id, tg_id, item_id, field):
         it = get_item(item_id)
@@ -2741,9 +3511,11 @@ class PremiumBot:
                 low = ""
             added = self.links_into(d, low)
             if added:
-                set_item(it_id, "link", d.get("link"))
-                set_item(it_id, "channel_link", d.get("channel_link"))
-                set_item(it_id, "group_link", d.get("group_link"))
+                # only overwrite the link fields the admin actually sent —
+                # never wipe an existing link with an empty one
+                for f in ("link", "channel_link", "group_link"):
+                    if d.get(f):
+                        set_item(it_id, f, d.get(f))
                 self.bot.send(chat_id, f"✅ Added: {esc(added)}")
             set_state(tg_id, {"flow": "add", "step": "post_validity", "d": d})
             self.bot.send(chat_id,
@@ -2781,17 +3553,17 @@ class PremiumBot:
         return u["name"] if u else "?"
 
     def broadcast(self, chat_id, text, media=None):
-        targets = q("SELECT tg_id FROM users WHERE is_admin=0 AND blocked=0")
+        targets = STORE.broadcast_tg_ids()
         if not (text or media):
             self.bot.send(chat_id, "❌ Nothing to send — type the message and try again.")
             return None
         head = f"📣 <b>{esc(setting('brand'))}</b>\n{SEP}\n"
         n = 0
-        for r in targets:
+        for tg in targets:
             if media:
-                self.bot.send_media(int(r["tg_id"]), media["file_kind"], media["file_id"], caption=head + esc(text)[:900])
+                self.bot.send_media(int(tg), media["file_kind"], media["file_id"], caption=head + esc(text)[:900])
             else:
-                self.bot.send(int(r["tg_id"]), head + esc(text)[:3000])
+                self.bot.send(int(tg), head + esc(text)[:3000])
             n += 1
             time.sleep(0.05)
         return n
@@ -2944,11 +3716,11 @@ def run_demo(db_file=None):
     OFFLINE = True
     if not ADMIN_IDS:
         ADMIN_IDS.add(1)
-    init_db()
+    init_db(force_sqlite=True)          # demo always uses a local SQLite file
     bot = Bot("demo-token", offline=True, label="TG")
     pb = PremiumBot(bot)
     print(DEMO_BANNER)
-    if not q("SELECT id FROM items LIMIT 1"):
+    if not STORE.has_any_item():
         print("  💡 The database is empty — start with:  a /additem   (or: a /add Demo course | 99 → a [video])")
     last = None
     while True:
@@ -2987,20 +3759,20 @@ def demo_meta(pb, line) -> bool:
         print("bye 👋  (the demo database is kept — use :reset to start clean)")
         return False
     if cmd == "items":
-        for r in q("SELECT * FROM items ORDER BY id"):
+        for r in STORE.items_all_asc(300):
             print(f"  #{r['id']:<3} {'🟢' if r['active'] else '⏸️'} {money(r['price']):>9} {r['kind']:<6} "
                   f"{shorten(r['title'], 30):<32} file={r['file_id'] or '-'} link={(r['link'] or '-')[:22]} "
                   f"ch={(r['channel_link'] or '-')[:18]} sold={r['sold']}")
         return True
     if cmd in ("pend", "pending"):
-        rows_ = q("SELECT * FROM orders WHERE status='pending' ORDER BY id DESC")
+        rows_ = STORE.orders_recent(60, status="pending")
         print("  (nothing pending)" if not rows_ else "")
         for r in rows_:
             print(f"  #{r['no']} {money(r['amount']):>9} user={r['user_id']} item={r['item_id']} "
                   f"proof={'📸' if r['proof_id'] else 'missing'}")
         return True
     if cmd == "orders":
-        for r in q("SELECT * FROM orders ORDER BY id DESC LIMIT 15"):
+        for r in STORE.orders_recent(15):
             print(f"  #{r['no']} {r['status']:<9} {money(r['amount']):>9} user={r['user_id']} item={r['item_id']} "
                   f"{ts(r['created_at'])}")
         return True
@@ -3019,7 +3791,7 @@ def demo_meta(pb, line) -> bool:
         pb.handle_update(mk_cb(tg, data or who))
         return True
     if cmd == "users":
-        for r in q("SELECT * FROM users ORDER BY id"):
+        for r in STORE.users_all():
             print(f"  id={r['id']} tg={r['tg_id']} {shorten(r['name'], 18):<20} "
                   f"{'ADMIN' if r['is_admin'] else 'user '} orders={r['orders']} spent={money(r['spent'])} "
                   f"blocked={r['blocked']}")
@@ -3029,15 +3801,14 @@ def demo_meta(pb, line) -> bool:
         print(f"🎭 acting as telegram id {n}") if n else print("Usage: :as 123456789")
         return True
     if cmd == "db":
-        for t in ("users", "items", "orders", "unlocks", "settings", "states"):
-            rows_ = q(f"SELECT * FROM {t} LIMIT 10")
+        for t in _TABLES:
+            rows_ = STORE.table_dump(t, 10)
             print(f"\n── {t} ({len(rows_)} shown)")
             for r in rows_:
                 print("   " + json.dumps({k: str(r[k])[:38] for k in r.keys()}, ensure_ascii=False))
         return True
     if cmd == "reset":
-        for t in ("users", "items", "orders", "unlocks", "settings", "states"):
-            x(f"DELETE FROM {t}")
+        STORE.reset_all()
         print("🧹 demo database cleared.")
         return True
     print(__doc__ if cmd == "help" else
@@ -3048,16 +3819,35 @@ def demo_meta(pb, line) -> bool:
 # ==========================================================================
 # SELFTEST
 # ==========================================================================
-def selftest() -> int:
-    global OFFLINE
+def _mongo_test_store(dbname):
+    """MongoStore for tests — the real MONGO_URI when set, otherwise mongomock."""
+    if MONGO_URI and MongoClient is not None:
+        return MongoStore(MONGO_URI, dbname)
+    try:
+        import mongomock
+    except Exception:
+        log("❌ --selftest-mongo needs MONGO_URI set, or the mongomock package (pip install mongomock)")
+        sys.exit(2)
+    return MongoStore(None, dbname, client=mongomock.MongoClient())
+
+
+def selftest(mongo=False) -> int:
+    global OFFLINE, STORE
     OFFLINE = True
     if not ADMIN_IDS:
         ADMIN_IDS.add(1)
-    globals()["DB_PATH"] = os.path.join(DATA_DIR, f"selftest_{os.getpid()}.db")
-    for suf in ("", "-wal", "-shm"):
-        if os.path.exists(DB_PATH + suf):
-            os.remove(DB_PATH + suf)
-    init_db()
+    if mongo:
+        STORE = _mongo_test_store(f"selftest_{os.getpid()}")
+        STORE.reset_all()
+        print("\033[1m── backend: MongoDB"
+              f"{' (' + MONGO_URI.split('@')[-1] + ')' if MONGO_URI else ' (in-memory mongomock)'}\033[0m")
+    else:
+        STORE = None
+        globals()["DB_PATH"] = os.path.join(DATA_DIR, f"selftest_{os.getpid()}.db")
+        for suf in ("", "-wal", "-shm"):
+            if os.path.exists(DB_PATH + suf):
+                os.remove(DB_PATH + suf)
+        init_db(force_sqlite=True)      # selftest always uses a throw-away SQLite file
     bot = Bot("demo", offline=True, label="T")
     pb = PremiumBot(bot)
     res = {"ok": 0, "fail": 0}
@@ -3108,13 +3898,19 @@ def selftest() -> int:
     pb.handle_update(mk_msg(1, "/add Free wallpaper | 0", media="photo"))
     pb.handle_update(mk_msg(1, "skip"))
     pb.handle_update(mk_msg(1, "0"))
-    items = q("SELECT * FROM items ORDER BY id")
+    items = STORE.items_all_asc(300)
     titles = [i["title"] for i in items]
     check("4 items created", len(items) == 4, f"→ {titles}")
     check("item 1 has file + channel link", items[0]["file_kind"] == "video" and items[0]["channel_link"])
     check("item 2 is a link item", items[1]["kind"] == "link" and "t.me/viprav" in items[1]["link"])
     check("item 3 is text/serial", items[2]["kind"] == "text" and "RAVI25" in items[2]["descr"])
     check("item 4 is free", float(items[3]["price"]) == 0)
+    pb.handle_update(mk_cb(1, f"postset:{items[1]['id']}"))          # add a channel link AFTER creation
+    pb.handle_update(mk_msg(1, "channel: https://t.me/extrachan"))
+    it2 = get_item(items[1]["id"])
+    check("post-links keeps the original main link",
+          "t.me/viprav" in (it2["link"] or "") and "t.me/extrachan" in (it2["channel_link"] or ""))
+    pb.handle_update(mk_cb(1, "wiz:lifetimepost"))
     bot.outbox.clear()
     pb.handle_update(mk_msg(1, "/additem"))
     check("add-item asks the type with buttons", "What do you want to add" in last_text("sendMessage", 1))
@@ -3122,7 +3918,7 @@ def selftest() -> int:
     pb.handle_update(mk_msg(1, "Editing Masterclass"))
     pb.handle_update(mk_msg(1, "299"))
     pb.handle_update(mk_msg(1, "", media="file"))
-    w = q("SELECT * FROM items ORDER BY id DESC LIMIT 1")[0]
+    w = STORE.items_all_desc(1)[0]
     check("simple wizard published the item", w["title"] == "Editing Masterclass" and int(w["active"]) == 1)
     check("simple wizard price", float(w["price"]) == 299)
     check("simple wizard file kept", w["file_kind"] == "document")
@@ -3163,7 +3959,7 @@ def selftest() -> int:
     head("Checkout — payment screen, screenshot required, admin notified")
     bot.outbox.clear()
     pb.handle_update(mk_cb(2, f"buy:{items[0]['id']}"))
-    o1 = q("SELECT * FROM orders ORDER BY id DESC LIMIT 1")[0]
+    o1 = STORE.order_last()
     check("pending order created", o1["status"] == "pending" and float(o1["amount"]) == 199.0)
     check("order number is 4 digits", re.fullmatch(r"#?\d{4}", o1["no"]) is not None, f"→ {o1['no']}")
     check("checkout screen shows the QR image", bool(out("sendPhoto", 2)))
@@ -3187,9 +3983,18 @@ def selftest() -> int:
     bot.outbox.clear()
     pb.handle_update(mk_cb(1, f"aok:{o1['id']}"))
     check("order approved", get_order(o1["id"])["status"] == "approved")
-    check("access recorded", q("SELECT * FROM unlocks WHERE order_id=?", (o1["id"],)) != [])
+    check("access recorded", STORE.unlocks_by_order(o1["id"]) != [])
     check("user received the video", bool(out("sendVideo", 2)))
-    check("delivery has channel button", "Join channel" in json.dumps(out("sendVideo", 2)[0]["params"]))
+    cap1 = out("sendVideo", 2)[0]["params"].get("caption", "")
+    check("delivery is a professional receipt", "PURCHASE SUCCESSFUL" in cap1 and "You paid" in cap1)
+    check("delivery receipt shows paid amount", "₹199" in cap1)
+    check("delivery shows order id + lifetime access", f"#{o1['no']}" in cap1 and "Lifetime" in cap1)
+    check("channel link clickable in the chat text",
+          "https://t.me/ravipremium" in cap1 and "Join channel" in cap1)
+    check("delivery hides empty description", "Description" not in cap1)
+    check("delivery has channel button with price",
+          "Join channel" in json.dumps(out("sendVideo", 2)[0]["params"], ensure_ascii=False) and
+          "₹199" in json.dumps(out("sendVideo", 2)[0]["params"], ensure_ascii=False))
     check("spend tracked on the user", float(user_by_id(2)["spent"]) == 199.0)
     check("sold counter increased", get_item(items[0]["id"])["sold"] == 1)
     pb.handle_update(mk_cb(2, "library"))
@@ -3201,7 +4006,7 @@ def selftest() -> int:
 
     head("Decline flow")
     pb.handle_update(mk_cb(3, f"buy:{items[1]['id']}"))
-    o2 = q("SELECT * FROM orders ORDER BY id DESC LIMIT 1")[0]
+    o2 = STORE.order_last()
     pb.handle_update(mk_msg(3, "", media="photo"))
     bot.outbox.clear()
     pb.handle_update(mk_cb(1, f"adcl:{o2['id']}"))
@@ -3218,12 +4023,14 @@ def selftest() -> int:
     check("re-opened order can be approved later", get_order(o2["id"])["status"] == "approved")
 
     head("Free item — instant unlock, no order")
-    before = len(q("SELECT * FROM orders"))
+    before = STORE.orders_all_count()
     bot.outbox.clear()
     pb.handle_update(mk_cb(4, f"buy:{items[3]['id']}"))
     check("free item unlocked immediately", has_access(user_by_tg(4)["id"], items[3]["id"]))
-    check("no extra order created", len(q("SELECT * FROM orders")) == before)
+    check("no extra order created", STORE.orders_all_count() == before)
     check("photo delivered to the customer", bool(out("sendPhoto", 4)))
+    fcap = out("sendPhoto", 4)[0]["params"].get("caption", "") if out("sendPhoto", 4) else ""
+    check("free delivery shows ACCESS UNLOCKED + FREE", "ACCESS UNLOCKED" in fcap and "FREE" in fcap)
 
     head("Panel buttons — edit price / visibility / delete")
     bot.outbox.clear()
@@ -3237,6 +4044,11 @@ def selftest() -> int:
     pb.handle_update(mk_cb(1, f"f:descr:{items[0]['id']}"))
     pb.handle_update(mk_msg(1, "Bonus: resume template included"))
     check("description edited", "resume template" in get_item(items[0]["id"])["descr"])
+    bot.outbox.clear()
+    pb.handle_update(mk_cb(2, f"open:{items[0]['id']}"))
+    r2 = out("sendVideo", 2)[0]["params"].get("caption", "") if out("sendVideo", 2) else ""
+    check("re-delivery includes the admin description", "Description" in r2 and "resume template" in r2)
+    check("re-delivery keeps clickable channel link", "https://t.me/ravipremium" in r2)
     pb.handle_update(mk_cb(1, f"f:validity_days:{items[0]['id']}"))
     pb.handle_update(mk_cb(1, "wiz:validity0"))
     check("validity set to lifetime by button", int(get_item(items[0]["id"])["validity_days"]) == 0)
@@ -3256,11 +4068,23 @@ def selftest() -> int:
     pb.handle_update(mk_cb(1, "pg:store"))
     check("store settings screen", "Store settings" in last_text("sendMessage", 1))
     pb.handle_update(mk_cb(1, "s:welcome_text"))
+    check("welcome edit screen offers Reset to default",
+          "Reset to default" in json.dumps(out("sendMessage", 1)[-1]["params"], ensure_ascii=False))
     pb.handle_update(mk_msg(1, "🎬 Welcome to Ravi Premium!\nHand-picked courses, instant delivery."))
     check("custom welcome text saved", "Hand-picked courses" in setting("welcome_text"))
     bot.outbox.clear()
     pb.handle_update(mk_msg(5, "/start"))
     check("custom welcome shown to new user", "Hand-picked" in last_text("sendPhoto", 5))
+    pb.handle_update(mk_cb(1, "pg:store"))
+    check("store settings show reset button while custom",
+          "Reset welcome to default" in json.dumps(out("sendMessage", 1)[-1]["params"], ensure_ascii=False))
+    pb.handle_update(mk_cb(1, "rstdfl:welcome_text"))
+    check("reset-to-default clears the custom welcome", setting("welcome_text") == "")
+    bot.outbox.clear()
+    pb.handle_update(mk_msg(5, "/start"))
+    p5 = (out("sendMessage", 5) or out("sendPhoto", 5))[-1]["params"]
+    check("default welcome is back after reset",
+          "Why buy from us" in (p5.get("text") or p5.get("caption") or ""))
     pb.handle_update(mk_cb(1, "s:force_channel"))
     pb.handle_update(mk_msg(1, "@ravipremium"))
     check("force channel saved", setting("force_channel") == "@ravipremium")
@@ -3317,7 +4141,7 @@ def selftest() -> int:
     bot.outbox.clear()
     pb.handle_update(mk_cb(1, "bcast"))
     pb.handle_update(mk_msg(1, "Weekend sale — 20% off everything!"))
-    n_customers = q("SELECT COUNT(*) c FROM users WHERE is_admin=0 AND blocked=0")[0]["c"]
+    n_customers = len(STORE.broadcast_tg_ids())
     check(f"broadcast reached {n_customers} customers", len(out("sendMessage")) >= n_customers)
     pb.handle_update(mk_cb(1, "stats"))
     check("sales report renders", "Total revenue" in last_text("sendMessage", 1))
@@ -3334,12 +4158,19 @@ def selftest() -> int:
     pb.handle_update(mk_msg(1, "/stats"))
     check("legacy /stats still works", "revenue" in last_text("sendMessage", 1))
 
-    print(f"\n{'═'*66}\n  SELFTEST RESULT:  {res['ok']} passed · {res['fail']} failed\n{'═'*66}")
-    for suf in ("", "-wal", "-shm"):
+    backend = "MongoDB" if mongo else "SQLite"
+    print(f"\n{'═'*66}\n  SELFTEST RESULT ({backend}):  {res['ok']} passed · {res['fail']} failed\n{'═'*66}")
+    if mongo:
         try:
-            os.remove(DB_PATH + suf)
+            STORE.client.drop_database(STORE.d.name)
         except Exception:
             pass
+    else:
+        for suf in ("", "-wal", "-shm"):
+            try:
+                os.remove(DB_PATH + suf)
+            except Exception:
+                pass
     return 0 if res["fail"] == 0 else 1
 
 # ==========================================================================
@@ -3421,7 +4252,7 @@ def apitest() -> int:
             os.remove(DB_PATH + suf)
     if not ADMIN_IDS:
         ADMIN_IDS.add(1)
-    init_db()
+    init_db(force_sqlite=True)          # apitest always uses a throw-away SQLite file
     bot = Bot("42:FAKETOKEN")
     pb = PremiumBot(bot)
     res = {"ok": 0, "fail": 0}
@@ -3465,7 +4296,7 @@ def apitest() -> int:
     check("proof acknowledged to the buyer", any(m == "sendMessage" for m, f in received))
     check("admin alert sent with buttons", any(str(f.get("chat_id")) == "1" and "Approve" in json.dumps(f)
                                                for m, f in received))
-    oid = q("SELECT id FROM orders ORDER BY id DESC LIMIT 1")[0]["id"]
+    oid = STORE.order_last()["id"]
     received.clear()
     pb.handle_update(mk_cb(1, f"aok:{oid}"))
     check("approve → sendVideo to the buyer", any(m == "sendVideo" and str(f.get("chat_id")) == "2" for m, f in received))
@@ -3490,14 +4321,74 @@ def apitest() -> int:
 
 
 # ==========================================================================
+# MIGRATION — one-time copy of the local SQLite shop into MongoDB
+# ==========================================================================
+def migrate_sqlite_to_mongo(force=False) -> int:
+    if not MONGO_URI:
+        print("❌ Set MONGO_URI first, e.g.\n"
+              "   export MONGO_URI=\"mongodb+srv://user:pass@cluster0.xxxx.mongodb.net\"\n"
+              "   python main.py --migrate")
+        return 2
+    if MongoClient is None:
+        print("❌ pymongo is missing — install it with:  pip install pymongo")
+        return 2
+    if not os.path.exists(DB_PATH):
+        print(f"❌ No SQLite database found at {DB_PATH} — nothing to migrate.")
+        return 2
+    src = SQLiteStore()
+    data = {t: src._q(f"SELECT * FROM {t}") for t in _TABLES}
+    total = sum(len(v) for v in data.values())
+    if total == 0:
+        print("ℹ️ The SQLite database is empty — nothing to migrate.")
+        return 0
+    try:
+        dst = MongoStore(MONGO_URI, MONGO_DB)
+    except Exception as e:
+        print(f"❌ MongoDB connection failed: {e}")
+        return 2
+    existing = sum(dst.d[t].count_documents({}) for t in _TABLES)
+    if existing and not force:
+        print(f"❌ MongoDB database '{MONGO_DB}' already has {existing} documents.\n"
+              "   Re-run with --force to OVERWRITE it, or point MONGO_DB at a fresh database.")
+        return 2
+    if existing and force:
+        dst.reset_all()
+        print(f"🧹 Cleared existing data in '{MONGO_DB}'.")
+    for t in ("users", "items", "orders", "unlocks"):
+        if data[t]:
+            dst.d[t].insert_many(data[t])
+    for r in data["settings"]:
+        dst.d.settings.update_one({"key": r["key"]}, {"$set": {"value": r["value"]}}, upsert=True)
+    for r in data["states"]:
+        dst.d.states.update_one({"user_id": r["user_id"]},
+                                {"$set": {"data": r["data"], "upd_at": r["upd_at"]}}, upsert=True)
+    for coll in ("users", "items", "orders"):
+        mx = max([r["id"] for r in data[coll]], default=0)
+        if mx:
+            dst.d.counters.update_one({"_id": coll}, {"$set": {"seq": mx}}, upsert=True)
+    print(f"✅ Migration complete — SQLite → MongoDB '{MONGO_DB}'\n"
+          f"   👥 users: {len(data['users'])}   📦 items: {len(data['items'])}   "
+          f"🧾 orders: {len(data['orders'])}\n"
+          f"   🔓 unlocks: {len(data['unlocks'])}   ⚙️ settings: {len(data['settings'])}   "
+          f"states: {len(data['states'])}\n\n"
+          "   The bot will now use MongoDB automatically (MONGO_URI is set).\n"
+          "   Keep the old premiumvideo.db file as a backup until you are happy.")
+    return 0
+
+
+# ==========================================================================
 def main():
     ap = argparse.ArgumentParser(
         prog="main.py",
         description="PremiumVideo — paid content bot for Telegram (single file)",
         epilog="No token yet?  --demo | --selftest | --apitest  (all run offline)")
     ap.add_argument("--demo", action="store_true", help="interactive console simulator (admin + customers)")
-    ap.add_argument("--selftest", action="store_true", help="run the automated lifecycle tests")
+    ap.add_argument("--selftest", action="store_true", help="run the automated lifecycle tests (SQLite backend)")
+    ap.add_argument("--selftest-mongo", action="store_true",
+                    help="same lifecycle tests against the MongoDB backend (MONGO_URI, or in-memory mongomock)")
     ap.add_argument("--apitest", action="store_true", help="verify HTTP calls against a fake Telegram server")
+    ap.add_argument("--migrate", action="store_true", help="copy the local SQLite database into MongoDB (MONGO_URI)")
+    ap.add_argument("--force", action="store_true", help="with --migrate: overwrite an existing MongoDB database")
     ap.add_argument("--token", help="BOT_TOKEN override")
     ap.add_argument("--admin", help="admin telegram id(s), comma separated")
     args = ap.parse_args()
@@ -3509,9 +4400,13 @@ def main():
         ADMIN_IDS.update(int(v) for v in re.split(r"[,\s]+", args.admin) if v.isdigit())
 
     if args.selftest:
-        sys.exit(selftest())
+        sys.exit(selftest(mongo=False))
+    if args.selftest_mongo:
+        sys.exit(selftest(mongo=True))
     if args.apitest:
         sys.exit(apitest())
+    if args.migrate:
+        sys.exit(migrate_sqlite_to_mongo(force=args.force))
 
     init_db()
     if args.demo:
