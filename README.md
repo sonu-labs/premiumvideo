@@ -22,6 +22,8 @@ python main.py
 ```
 
 * Token: [@BotFather](https://t.me/BotFather) → `/newbot`.
+* Secrets stay in the environment: export them as above, **or** put `BOT_TOKEN=…` / `ADMIN_IDS=…`
+  in a `.env` file next to `main.py` (it is git-ignored; real env vars always win).
 * `ADMIN_IDS` empty → **the first person who sends /start becomes the admin** (then set the env var).
 * No `requests` installed? It still runs (urllib fallback). `qrcode` + `pillow` are only for the auto QR image.
 * Storage: SQLite file `premiumvideo.db` — that single file *is* your database (backup = copy it).
@@ -68,7 +70,7 @@ Console shortcuts: `:items :pend :orders :approve 1 :decline 1 wrong amount :use
 | **⏳ Approvals** | pending payments with proof screenshot, ✅ Approve & deliver / ❌ Decline (reason asked), 🗑 Approve all |
 | **🧾 All orders** | every order with status; tap one for details, 🖼 screenshot, 🔁 re-deliver, ↩️ re-open |
 | **💳 Payment setup** | UPI id, payee name, **upload / remove QR**, checkout note, refund note, extra instructions, checkout preview |
-| **🏪 Store settings** | brand name, **welcome text**, **welcome photo**, force-channel-join, empty-store note, welcome preview |
+| **🏪 Store settings** | brand name, **welcome text**, **welcome photo**, force-channel-join, empty-store note, **📹 free-demo link**, **📢 proofs channel**, **🚨 support link**, **display stats** (joined / month / today), welcome preview |
 | **📊 Sales report** | revenue, today, 7 days, best sellers |
 | **👥 Customers** | profile → 🎁 grant free access, 📣 private message, 🚫 block, 🧾 their orders |
 | **📣 Broadcast** | text or image to all customers |
@@ -94,8 +96,10 @@ checkout, so the amount and order id are already filled when the customer scans 
 ## 3. Customer flow
 
 ```
-/start    welcome photo + text + [🛍 Browse store] [📚 My library] [🧾 My orders] [💳 Payment info] [❓ Help]
-/shop     item list with prices, ✅ marks owned items, ◀️/▶️ paging, tap for the item page
+/start    welcome photo + text (blockquote / spoiler formatting, TECH SUPPORT line,
+          👥🔥 counters the admin can set) + [🎬 BUY VIDEOS] [📹 FREE DEMO ↗] [📢 PROOFS ↗]
+          [👤 MY PROFILE] [🚨 SUPPORT] [📘 HOW TO USE]
+/shop     every item is its own button — "🎬 Title (₹199)" — plus ⬅ Back, ◀️/▶️ paging, ✅ marks owned
 💵 Buy    order created (#0001) → checkout screen: QR image, UPI id, exact amount, order id note
 📸 Proof  the bot only accepts an actual photo/file — text is refused
 ⏳         "Proof received — waiting for admin approval"
