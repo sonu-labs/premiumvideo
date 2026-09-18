@@ -50,6 +50,24 @@ except Exception:  # only used to auto-generate the UPI QR image
 # CONFIGURATION  (everything can also be overridden with environment vars)
 # ==========================================================================
 ROOT = os.path.dirname(os.path.abspath(__file__))
+
+# optional .env file (never overrides real environment variables) — keeps
+# BOT_TOKEN / ADMIN_IDS out of the command line and out of git (.gitignore).
+_ENV_FILE = os.path.join(ROOT, ".env")
+if os.path.exists(_ENV_FILE):
+    try:
+        with open(_ENV_FILE, encoding="utf-8") as _fh:
+            for _line in _fh:
+                _line = _line.strip()
+                if not _line or _line.startswith("#") or "=" not in _line:
+                    continue
+                _k, _v = _line.split("=", 1)
+                _k, _v = _k.strip(), _v.strip().strip("'\"")
+                if _k and _k not in os.environ:
+                    os.environ[_k] = _v
+    except Exception:
+        pass
+
 DB_PATH = os.getenv("DB_PATH") or os.path.join(ROOT, "premiumvideo.db")
 DATA_DIR = os.getenv("DATA_DIR") or os.path.join(ROOT, "data")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -122,6 +140,18 @@ def to_num(s):
 def shorten(s, n=32):
     s = (s or "").strip().replace("\n", " ")
     return s if len(s) <= n else s[: n - 1].rstrip() + "…"
+
+
+def t_url(v: str) -> str:
+    """'@chan' / 't.me/x' / 'https://…' -> a clickable https url ('' if empty)."""
+    v = (v or "").strip()
+    if not v:
+        return ""
+    if v.startswith(("http://", "https://")):
+        return v
+    if v.startswith("t.me/"):
+        return "https://" + v
+    return "https://t.me/" + v.lstrip("@")
 
 
 # ==========================================================================
@@ -243,6 +273,12 @@ DEFAULTS = {
     "welcome_text": "",
     "force_channel": "",
     "out_of_stock_note": "",
+    "demo_link": "",        # 📹 FREE DEMO button (channel / link)
+    "proofs_link": "",      # 📢 PROOFS button (channel / link)
+    "support_link": "",     # 🚨 SUPPORT button + "TECH SUPPORT –" line
+    "stats_joined": "",     # display-only numbers for the welcome screen
+    "stats_month": "",      # (admin sets them; empty = real counts)
+    "stats_today": "",
 }
 
 
@@ -621,7 +657,10 @@ SET_LABELS = {"brand": "Brand name", "upi_id": "UPI ID", "payee_name": "Payee na
               "pay_note": "Checkout note", "refund_note": "Refund note",
               "pay_instructions": "Extra instructions", "welcome_text": "Welcome message",
               "force_channel": "Force channel join", "out_of_stock_note": "Empty-store note",
-              "qr_file_id": "QR image", "welcome_photo_id": "Welcome photo"}
+              "qr_file_id": "QR image", "welcome_photo_id": "Welcome photo",
+              "demo_link": "Free demo link", "proofs_link": "Proofs channel",
+              "support_link": "Support link", "stats_joined": "Stats — users joined",
+              "stats_month": "Stats — active this month", "stats_today": "Stats — active today"}
 
 
 class PremiumBot:
@@ -791,30 +830,73 @@ class PremiumBot:
     # USER: WELCOME / HOME
     # ======================================================================
     def home_kb(self, uid):
-        return [
-            [btn("🛍 Browse store", "shop:0"), btn("📚 My library", "library")],
-            [btn("🧾 My orders", "orders"), btn("💳 Payment info", "payinfo")],
-            [btn("❓ Help & rules", "help")],
-        ]
+        """Main menu — same layout as the reference screenshots."""
+        s = all_settings()
+        out = [[btn("🎬 BUY VIDEOS", "shop:0")]]
+        link_row = []
+        if s["demo_link"]:
+            link_row.append(btn("📹 FREE DEMO ↗", None, t_url(s["demo_link"])))
+        if s["proofs_link"]:
+            link_row.append(btn("📢 PROOFS ↗", None, t_url(s["proofs_link"])))
+        if link_row:
+            out.append(link_row)
+        out.append([btn("👤 MY PROFILE", "profile"),
+                    btn("🚨 SUPPORT", None, t_url(s["support_link"])) if s["support_link"]
+                    else btn("🚨 SUPPORT", "support")])
+        out.append([btn("📘 HOW TO USE", "howto")])
+        return out
+
+    def stats_lines(self) -> str:
+        """Welcome-screen counters. Admin-set values win; empty = real counts."""
+        s = all_settings()
+        joined = (s["stats_joined"] or "").strip()
+        month = (s["stats_month"] or "").strip()
+        today = (s["stats_today"] or "").strip()
+        if not joined or not month or not today:
+            m30 = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
+            d0 = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+            d0 = d0.strftime("%Y-%m-%d %H:%M:%S")
+            rj = q("SELECT COUNT(*) c FROM users")[0]["c"]
+            rm = q("SELECT COUNT(*) c FROM users WHERE last_seen >= ?", (m30,))[0]["c"]
+            rt = q("SELECT COUNT(*) c FROM users WHERE last_seen >= ?", (d0,))[0]["c"]
+            joined = joined or str(rj)
+            month = month or str(rm)
+            today = today or str(rt)
+        return (f"👥 <b>{esc(joined)}</b> users already joined\n"
+                f"🔥 <b>{esc(month)}</b> active this month · ⚡ <b>{esc(today)}</b> active today")
+
+    def support_line(self) -> str:
+        s = all_settings()
+        sup = (s["support_link"] or "").strip()
+        if not sup:
+            return "🛠 <b>TECH SUPPORT</b> – tap <i>🚨 SUPPORT</i> below"
+        if sup.startswith("@"):
+            return f"🛠 <b>TECH SUPPORT</b> – <a href=\"{t_url(sup)}\">{esc(sup)}</a>"
+        return f"🛠 <b>TECH SUPPORT</b> – <a href=\"{t_url(sup)}\">{esc(shorten(sup, 32))}</a>"
 
     def default_welcome(self) -> str:
         s = all_settings()
         price = q("SELECT MIN(price) mn FROM items WHERE active=1")
         lowest = price[0]["mn"] if price and price[0]["mn"] is not None else None
-        lines = [f"🎬 <b>{esc(s['brand'])}</b>", SEP,
-                 "Premium content, delivered instantly after payment verification.", "",
-                 "1️⃣ Pick an item — the price shown is final",
-                 "2️⃣ Pay with the QR / UPI ID",
-                 "3️⃣ Send the payment screenshot",
-                 "4️⃣ Admin approves → content unlocks in your library",
+        lines = [f"🎬 <b><u>{esc(s['brand'])}</u></b>",
                  "",
-                 f"💸 From <b>{money(lowest)}</b>" if lowest is not None else "🛍 Items are added by the admin"]
+                 "<blockquote>⚡️ <i>Premium videos, courses & VIP access</i> —\n"
+                 "delivered <b>instantly</b> after payment verification. 🔐</blockquote>",
+                 "",
+                 f"💸 Plans from <b>{money(lowest)}</b> · 🎁 some drops are <i>free</i>"
+                 if lowest is not None else "🛍 New videos are added by the admin",
+                 f"🤫 <tg-spoiler>new uploads every week — stay tuned</tg-spoiler>"]
         return "\n".join(lines)
 
+    def welcome_body(self) -> str:
+        """Custom welcome text (if any) + the always-on support & stats footer."""
+        s = all_settings()
+        body = s["welcome_text"] or self.default_welcome()
+        return f"{body}\n\n{self.support_line()}\n{self.stats_lines()}"
+
     def welcome_preview_text(self) -> str:
-        txt = setting("welcome_text") or self.default_welcome()
         photo = "🖼 Welcome photo: <b>set</b> ✅" if setting("welcome_photo_id") else "🖼 Welcome photo: <i>not set</i>"
-        return f"{txt}\n\n{SEP}\n{photo}"
+        return f"{self.welcome_body()}\n\n{SEP}\n{photo}"
 
     def cmd_start(self, chat_id, tg_id, uid, m, text):
         deep = re.search(r"/start\s+(\S+)", text or "")
@@ -834,7 +916,7 @@ class PremiumBot:
     def send_welcome(self, chat_id, uid):
         """Welcome screen — photo (if the admin set one) + text + buttons."""
         s = all_settings()
-        body = s["welcome_text"] or self.default_welcome()
+        body = self.welcome_body()
         buttons = self.home_kb(uid)
         photo = s["welcome_photo_id"]
         if photo:
@@ -890,18 +972,19 @@ class PremiumBot:
             includes.append("private channel")
         if it["group_link"]:
             includes.append("private group")
-        access = "Lifetime access" if not it["validity_days"] else f"{it['validity_days']} days access"
-        out = [f"{icon} <b>{esc(it['title'])}</b>", SEP,
-               f"💵 Price: <b>{money(it['price'])}</b>" if it["price"] > 0 else "🎁 <b>Free</b>",
-               f"⏱ {access}",
-               f"📦 Includes: {', '.join(includes)}" if includes else "",
-               f"🛒 {it['sold']} sold" if it["sold"] else ""]
+        access = "<i>Lifetime</i> ♾" if not it["validity_days"] else f"<i>{it['validity_days']} days</i>"
+        out = [f"{icon} <b><u>{esc(it['title'])}</u></b>  <i>#{it['id']}</i>",
+               "",
+               f"💵 Price: <code>{money(it['price'])}</code>" if it["price"] > 0 else "💵 Price:  <b>Free</b>",
+               f"⏱ Access: {access}",
+               f"📦 Includes: {', '.join(includes)}" if includes else "📦 Includes: <i>—</i>",
+               f"🛒 Sold: <b>{it['sold']}</b>" if it["sold"] else ""]
         if it["descr"]:
-            out += ["", esc(it["descr"])[:1500]]
+            out += ["", f"<blockquote>{esc(it['descr'])[:1500]}</blockquote>"]
         if uid and has_access(uid, it["id"]):
-            out += ["", "✅ <b>Already unlocked</b> — open it from your library."]
+            out += ["", "✅ <b>Already unlocked</b> — open it from your <i>📚 library</i>."]
         elif it["price"] > 0:
-            out += ["", f"{SEP}\n💳 {esc(s['pay_note'])[:160]}"]
+            out += ["", f"<s>hidden fees</s> <b>none</b> — {esc(s['pay_note'])[:160]}"]
         return "\n".join([l for l in out if l != ""])
 
     def show_store(self, chat_id, uid, page=0, search=""):
@@ -919,14 +1002,16 @@ class PremiumBot:
             msg = ("🔍 Nothing matched that search." if search else
                    f"🛒 The store is empty right now.\n{SEP}\n{esc(setting('out_of_stock_note') or 'Please check back soon.')}")
             return self.bot.send(chat_id, msg, kb(rows([btn("🏠 Home", "home")])))
-        lines, buttons = [], []
+        # one button per item — "Title (₹price)" — like the reference UI
+        buttons = []
         for it in chunk:
-            mark = "  ✅" if uid and has_access(uid, it["id"]) else ""
-            price = "FREE" if it["price"] <= 0 else money(it["price"])
-            lines.append(f"<b>#{it['id']}</b> · {esc(shorten(it['title'], 40))} · <b>{price}</b>{mark}")
-            buttons.append([btn(("📚 Open" if mark else f"💵 {price} — Buy"), f"buy:{it['id']}"),
-                            btn(f"ℹ️ #{it['id']}", f"item:{it['id']}")])
-        head = f"🛍 <b>{esc(setting('brand'))}</b> · Store\n{total} item{'s' if total != 1 else ''} available"
+            mark = "✅ " if uid and has_access(uid, it["id"]) else ""
+            icon = {"video": "🎬", "photo": "🖼", "file": "📁", "link": "🔗", "text": "📝"}.get(it["kind"], "🎬")
+            price = "Free" if it["price"] <= 0 else money(it["price"])
+            buttons.append([btn(f"{mark}{icon} {shorten(it['title'], 40)} ({price})", f"item:{it['id']}")])
+        head = (f"🛒 <b><u>{esc(setting('brand'))}</u></b> — <b>Video Store</b>\n\n"
+                f"<blockquote>🎬 <b>{total}</b> item{'s' if total != 1 else ''} live — "
+                f"tap one to view & buy.\nPrices are <i>final</i>, delivery is <i>instant</i>.</blockquote>")
         if search:
             head += f"\n🔍 results for “{esc(search)}”"
         nav = []
@@ -934,11 +1019,12 @@ class PremiumBot:
             nav.append(btn("◀️ Prev", f"shop:{page - 1}"))
         if page < pages - 1:
             nav.append(btn("Next ▶️", f"shop:{page + 1}"))
-        nav.append(btn("🏠 Home", "home"))
+        if nav:
+            buttons.append(nav)
+        buttons.append([btn("⬅ Back", "home")])
         self.bot.send(chat_id,
-                      head + f"\n{SEP}\n\n" + "\n".join(lines) +
-                      (f"\n\nPage {page + 1}/{pages}" if pages > 1 else ""),
-                      kb(buttons + [nav]))
+                      head + (f"\n\n<i>Page {page + 1}/{pages}</i>" if pages > 1 else ""),
+                      kb(buttons))
 
     def show_item(self, chat_id, uid, it):
         buttons = []
@@ -948,8 +1034,8 @@ class PremiumBot:
             buttons.append([btn(f"💵 Buy for {money(it['price'])}", f"buy:{it['id']}")])
         else:
             buttons.append([btn("🎁 Get it free", f"buy:{it['id']}")])
-        buttons.append([btn("💳 Payment info", "payinfo"), btn("❓ Help", "help")])
-        buttons.append([btn("🛍 Back to store", "shop:0")])
+        buttons.append([btn("💳 Payment info", "payinfo"), btn("📘 How to use", "howto")])
+        buttons.append([btn("⬅ Back", "shop:0")])
         self.bot.send(chat_id, self.item_caption(it, uid), kb(buttons))
 
     # ======================================================================
@@ -999,19 +1085,20 @@ class PremiumBot:
         s = all_settings()
         amount = float(order["amount"]) if order else float(it["price"])
         o_no = order["no"] if order else ""
-        body = [f"💳 <b>Pay {money(amount)}</b>", SEP]
+        body = [f"💳 <b><u>Checkout</u></b> — <b>{money(amount)}</b>", ""]
         if note:
             body += [note, ""]
-        body += [f"Order ID: <code>#{o_no}</code>",
-                 f"Item: {esc(shorten(it['title'], 40))}", ""]
+        body += [f"🎬 Item: <i>{esc(shorten(it['title'], 40))}</i>",
+                 f"🧾 Order ID: <code>#{o_no}</code>", ""]
         if s["upi_id"]:
             body.append(f"UPI ID: <code>{esc(s['upi_id'])}</code>")
-            body.append(f"Payee: {esc(s['payee_name'] or s['brand'])}")
+            body.append(f"Payee: <b>{esc(s['payee_name'] or s['brand'])}</b>")
+            body.append(f"<pre>TO   : {s['upi_id']}\nAMT  : {amount:.2f}\nNOTE : #{o_no}</pre>")
         else:
             body.append("⚠️ The admin has not added a UPI ID yet — please message the admin.")
-        body.append(f"Amount: <b>{money(amount)}</b> (exact)")
-        body.append(f"Payment note (optional): <code>#{o_no}</code>")
-        body += ["", SEP, esc(s["pay_note"]), f"\n{esc(s['pay_instructions'])}" if s["pay_instructions"] else ""]
+        body.append(f"Amount: <b>{money(amount)}</b> <i>(exact)</i>")
+        body += ["", f"<blockquote>{esc(s['pay_note'])}"
+                 + (f"\n{esc(s['pay_instructions'])}" if s["pay_instructions"] else "") + "</blockquote>"]
         text = "\n".join([l for l in body if l is not None])
         buttons = rows([btn("📤 I paid — submit screenshot", f"ready:{order['id'] if order else 0}")],
                        [btn("💳 Payment info", "payinfo"), btn("❌ Cancel order", f"cancel:{order['id'] if order else 0}")],
@@ -1039,13 +1126,69 @@ class PremiumBot:
         it = get_item(o["item_id"]) if o else None
         if o and it:
             return self.payment_screen(chat_id, uid, o, it)
-        body = ["💳 <b>Payment details</b>", SEP,
+        body = ["💳 <b><u>Payment details</u></b>",
+                "",
                 f"UPI ID: <code>{esc(s['upi_id'] or 'not configured')}</code>",
-                f"Payee: {esc(s['payee_name'] or s['brand'])}",
-                f"QR image: {'✅ available on the checkout screen' if s['qr_file_id'] or s['upi_id'] else '❌ not set'}",
-                "", esc(s["pay_note"]), "", esc(s["refund_note"])]
+                f"Payee: <b>{esc(s['payee_name'] or s['brand'])}</b>",
+                f"QR image: {'✅ on the checkout screen' if s['qr_file_id'] or s['upi_id'] else '❌ not set'}",
+                "",
+                f"<blockquote>{esc(s['pay_note'])}\n\n<i>{esc(s['refund_note'])}</i></blockquote>"]
         self.bot.send(chat_id, "\n".join(body),
-                      kb(rows([btn("🛍 Browse store", "shop:0")], [btn("🏠 Home", "home")])))
+                      kb(rows([btn("🎬 BUY VIDEOS", "shop:0")], [btn("⬅ Back", "home")])))
+
+    # =====================================================================
+    # USER: PROFILE / HOW TO USE / SUPPORT
+    # =====================================================================
+    def show_profile(self, chat_id, uid):
+        row = user_by_id(uid)
+        u = dict(row) if row else {}
+        lib = q("SELECT COUNT(*) c FROM unlocks WHERE user_id=?", (int(uid),))[0]["c"]
+        body = ["👤 <b><u>MY PROFILE</u></b>",
+                "",
+                f"🆔 Bot ID: <code>{uid}</code> · TG: <code>{esc(str(u.get('tg_id', '')))}</code>",
+                f"🧾 Orders: <b>{u.get('orders', 0)}</b> · 💸 Spent: <code>{money(u.get('spent', 0))}</code>",
+                f"📚 Library: <b>{lib}</b> item{'s' if lib != 1 else ''}",
+                f"🗓 Joined: <i>{ts(u.get('created_at', ''))}</i>",
+                "",
+                f"<blockquote>{esc(u.get('name', ''))} {esc(u.get('username', ''))}\n"
+                f"<i>Status:</i> {'⭐ valued customer' if (u.get('spent') or 0) > 0 else '🌱 new member'}</blockquote>"]
+        self.bot.send(chat_id, "\n".join(body),
+                      kb(rows([btn("📚 My library", "library"), btn("🧾 My orders", "orders")],
+                              [btn("💳 Payment info", "payinfo")],
+                              [btn("⬅ Back", "home")])))
+
+    def show_howto(self, chat_id):
+        s = all_settings()
+        upi = f"<code>{esc(s['upi_id'])}</code>" if s["upi_id"] else "<i>shown at checkout</i>"
+        body = ["📘 <b><u>HOW TO USE</u></b>",
+                "",
+                "<b>1️⃣ Pick a video</b> — tap <i>🎬 BUY VIDEOS</i> and choose one.",
+                f"<b>2️⃣ Pay the exact amount</b> — UPI {upi} or scan the QR.",
+                "<b>3️⃣ Send the screenshot</b> — 📸 photo of the successful payment.",
+                "<b>4️⃣ Get it instantly</b> — admin approves → content lands in your <i>📚 library</i>.",
+                "",
+                "<blockquote>⚠️ Send the <i>exact</i> amount. Wrong / short payments are "
+                f"<s>kept</s> <b>refunded</b> — {esc(s['refund_note'])[:140]}</blockquote>",
+                "",
+                "🤫 <tg-spoiler>free items unlock instantly — no payment needed</tg-spoiler>",
+                f"💡 Preview quality first in the <i>📹 FREE DEMO</i> channel."
+                if s["demo_link"] else ""]
+        self.bot.send(chat_id, "\n".join([l for l in body if l != ""]),
+                      kb(rows([btn("🎬 BUY VIDEOS", "shop:0"), btn("💳 Payment info", "payinfo")],
+                              [btn("⬅ Back", "home")])))
+
+    def show_support(self, chat_id):
+        s = all_settings()
+        body = ["🚨 <b><u>SUPPORT</u></b>",
+                "",
+                "<blockquote>Problem with a payment or a video?\n"
+                "Message the admin directly — you'll get a reply in this chat.</blockquote>"]
+        if s["support_link"]:
+            body.append(f"🛠 <b>TECH SUPPORT</b> – <a href=\"{t_url(s['support_link'])}\">"
+                        f"{esc(s['support_link'])}</a>")
+        self.bot.send(chat_id, "\n".join(body),
+                      kb(rows([btn("💬 Message admin", "contact_admin")],
+                              [btn("⬅ Back", "home")])))
 
     def submit_proof(self, chat_id, tg_id, uid, order, media, note=""):
         if not media:
@@ -1292,17 +1435,29 @@ class PremiumBot:
     def admin_store_setup(self, chat_id):
         s = all_settings()
         custom = "✅ custom" if s["welcome_text"] else "🤖 default"
-        body = ["🏪 <b>Store settings</b>", SEP,
+        body = ["🏪 <b><u>Store settings</u></b>", SEP,
                 f"Brand name: <b>{esc(s['brand'])}</b>",
                 f"Welcome text: {custom}",
                 f"Welcome photo: {'✅ set' if s['welcome_photo_id'] else '❌ not set'}",
                 f"Force channel join: {esc(s['force_channel'] or 'off')}",
                 f"Empty-store note: {esc(s['out_of_stock_note'] or '—')}",
-                "", "The welcome screen is what a user sees on /start."]
+                "",
+                "<b>Home-screen buttons & counters</b>",
+                f"📹 Free demo: {esc(s['demo_link'] or '— not set')}",
+                f"📢 Proofs channel: {esc(s['proofs_link'] or '— not set')}",
+                f"🚨 Support: {esc(s['support_link'] or '— not set (in-bot messages)')}",
+                f"👥 Stats: joined <code>{esc(s['stats_joined'] or 'auto')}</code> · "
+                f"month <code>{esc(s['stats_month'] or 'auto')}</code> · "
+                f"today <code>{esc(s['stats_today'] or 'auto')}</code>",
+                "", "<i>The welcome screen is what a user sees on /start.</i>"]
         buttons = rows(
             [btn("🏷 Brand name", "s:brand"), btn("👋 Welcome text", "s:welcome_text")],
             [btn("🖼 Set welcome photo", "setwelcomephoto"), btn("🗑 Remove photo", "delwelcomephoto")],
             [btn("📢 Force channel join", "s:force_channel"), btn("📦 Empty-store note", "s:out_of_stock_note")],
+            [btn("📹 Free demo link", "s:demo_link"), btn("📢 Proofs channel", "s:proofs_link")],
+            [btn("🚨 Support link", "s:support_link")],
+            [btn("👥 Stats joined", "s:stats_joined"), btn("🔥 Stats month", "s:stats_month"),
+             btn("⚡ Stats today", "s:stats_today")],
             [btn("👁 Preview welcome", "pg:previewwelcome"), btn("🔙 Back", "admin")])
         self.bot.send(chat_id, "\n".join(body), kb(buttons))
 
@@ -1739,6 +1894,12 @@ class PremiumBot:
         if data == "contact_admin":
             set_state(tg_id, {"flow": "toadmin", "step": "text", "d": {}})
             return self.bot.send(chat_id, "✍️ Type your message — it will be delivered to the admin.")
+        if data == "profile":
+            return self.show_profile(chat_id, uid)
+        if data == "howto":
+            return self.show_howto(chat_id)
+        if data == "support":
+            return self.show_support(chat_id)
         if data.startswith("shop:"):
             return self.show_store(chat_id, uid, int(data[5:] or 0))
         if data.startswith("item:"):
@@ -2078,7 +2239,13 @@ class PremiumBot:
                   "brand": ("Brand name", "Shown in the header of the store"),
                   "welcome_text": ("Welcome text", "Send the text shown on /start (with your welcome photo)"),
                   "force_channel": ("Force channel join", "Send <code>@username</code> or a t.me link. Send <code>off</code> to disable"),
-                  "out_of_stock_note": ("Empty-store note", "Shown when no item is published")}
+                  "out_of_stock_note": ("Empty-store note", "Shown when no item is published"),
+                  "demo_link": ("Free demo link", "Channel / link behind the 📹 FREE DEMO button, e.g. <code>@mydemo</code>"),
+                  "proofs_link": ("Proofs channel", "Channel / link behind the 📢 PROOFS button, e.g. <code>@myproofs</code>"),
+                  "support_link": ("Support link", "Username or link for 🚨 SUPPORT, e.g. <code>@support</code>"),
+                  "stats_joined": ("Stats — users joined", "Display-only number on the welcome screen (empty = real count)"),
+                  "stats_month": ("Stats — active this month", "Display-only number (empty = real count)"),
+                  "stats_today": ("Stats — active today", "Display-only number (empty = real count)")}
         label, hint = labels.get(key, (key, "Send the new value"))
         cur = setting(key)
         set_state(tg_id, {"flow": "setfield", "step": key, "d": {}})
@@ -2749,12 +2916,28 @@ def selftest() -> int:
     pb.handle_update(mk_msg(2, "/start"))
     check("welcome sent as photo (with caption)", bool(out("sendPhoto", 2)) and
           "Ravi Premium" in (out("sendPhoto", 2)[0]["params"].get("caption", "") if out("sendPhoto", 2) else ""))
-    check("welcome has store buttons", "Browse store" in json.dumps(out("sendPhoto", 2)[0]["params"]))
+    check("welcome has the new main-menu buttons",
+          "BUY VIDEOS" in json.dumps(out("sendPhoto", 2)[0]["params"]) and
+          "HOW TO USE" in json.dumps(out("sendPhoto", 2)[0]["params"]))
+    check("welcome shows stats + support footer",
+          "users already joined" in (out("sendPhoto", 2)[0]["params"].get("caption", "") if out("sendPhoto", 2) else ""))
     pb.handle_update(mk_cb(2, "shop:0"))
-    check("store lists items with prices", "Python Full Course" in last_text("sendMessage", 2) and "₹199" in last_text("sendMessage", 2))
+    check("store lists items as buttons with prices",
+          "Python Full Course" in json.dumps(out("sendMessage", 2)[-1]["params"], ensure_ascii=False) and
+          "₹199" in json.dumps(out("sendMessage", 2)[-1]["params"], ensure_ascii=False))
     pb.handle_update(mk_cb(2, f"item:{items[0]['id']}"))
     check("item page shows includes + buy", "file download" in last_text("sendMessage", 2) and
           "Buy" in json.dumps(out("sendMessage", 2)[-1]["params"]))
+    pb.handle_update(mk_cb(2, "howto"))
+    check("how-to-use screen renders", "HOW TO USE" in last_text("sendMessage", 2) and
+          "<blockquote>" in last_text("sendMessage", 2))
+    pb.handle_update(mk_cb(2, "profile"))
+    check("profile screen renders", "MY PROFILE" in last_text("sendMessage", 2) and
+          "Library" in last_text("sendMessage", 2))
+    pb.handle_update(mk_cb(2, "support"))
+    check("support screen renders", "SUPPORT" in last_text("sendMessage", 2) and
+          "Message admin" in json.dumps(out("sendMessage", 2)[-1]["params"]))
+    pb.handle_update(mk_cb(2, "home"))
 
     head("Checkout — payment screen, screenshot required, admin notified")
     bot.outbox.clear()
@@ -2840,7 +3023,7 @@ def selftest() -> int:
     check("publish toggled off", int(get_item(items[2]["id"])["active"]) == 0)
     pb.handle_update(mk_cb(2, "shop:0"))
     check("hidden item disappears from the store",
-          "Course coupon" not in last_text("sendMessage", 2))
+          "Course coupon" not in json.dumps(out("sendMessage", 2)[-1]["params"], ensure_ascii=False))
     pb.handle_update(mk_cb(1, f"tog:{items[2]['id']}"))
     check("publish toggled back on", int(get_item(items[2]["id"])["active"]) == 1)
     pb.handle_update(mk_cb(1, f"del:{items[2]['id']}"))
@@ -2923,7 +3106,8 @@ def selftest() -> int:
     pb.handle_update(mk_cb(9, f"open:{items[0]['id']}"))
     check("locked item cannot be opened", "locked" in last_text("sendMessage", 9).lower())
     pb.handle_update(mk_msg(9, "python"))
-    check("plain text searches the store", "Python Full Course" in last_text("sendMessage", 9))
+    check("plain text searches the store",
+          "Python Full Course" in json.dumps(out("sendMessage", 9)[-1]["params"], ensure_ascii=False))
     pb.handle_update(mk_msg(1, "/unstick 9"))
     check("/unstick resets a stuck step", get_state(9) == {})
     pb.handle_update(mk_msg(1, "/stats"))
