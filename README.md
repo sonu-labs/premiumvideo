@@ -32,7 +32,7 @@ python main.py
 
 ```bash
 python main.py --demo        # interactive simulator: the terminal becomes Telegram
-python main.py --selftest    # 89 checks over the whole lifecycle
+python main.py --selftest    # 94 checks over the whole lifecycle
 python main.py --apitest     # 16 checks: real HTTP calls verified against a fake Telegram server
 ```
 
@@ -45,13 +45,11 @@ a #s:upi_id               →  ravi@ybl
 a #setqr                  →  a [photo]            ← your real UPI QR image
 a #setwelcomephoto        →  a [photo]            ← photo on the /start screen
 a #newitem                                        ← or: a /additem
-   Python Full Course
-   199
-   40 hours of lessons + project files
-   a [video]
-   channel: https://t.me/ravipremium
-   0                                                 ← 0 = lifetime, 30 = 30 days
-u /shop → u #buy:1 → u #ready:1 → u [photo] paid
+   a #wtype:video                                 ← pick the type (video / photo / file / link / text)
+   Python Full Course                             ← name
+   199                                            ← price (0 = free)
+   a [video]                                      ← the content itself
+u /shop → u #item:1 → u #ready:1 → u [photo] paid
 a #pend → ✅ Approve
 u /library                                          ← content is there
 ```
@@ -97,16 +95,25 @@ checkout, so the amount and order id are already filled when the customer scans 
 
 ```
 /start    welcome photo + text (blockquote / spoiler formatting, TECH SUPPORT line,
-          👥🔥 counters the admin can set) + [🎬 BUY VIDEOS] [📹 FREE DEMO ↗] [📢 PROOFS ↗]
-          [👤 MY PROFILE] [🚨 SUPPORT] [📘 HOW TO USE]
-/shop     every item is its own button — "🎬 Title (₹199)" — plus ⬅ Back, ◀️/▶️ paging, ✅ marks owned
-💵 Buy    order created (#0001) → checkout screen: QR image, UPI id, exact amount, order id note
+          👥🔥 counters the admin can set) + [Buy Premium Videos] [Free demo ↗] [Proofs ↗]
+          [My profile] [Support] [How to use] — premium emoji icons + colored buttons
+/shop     every item is its own button — "Title (₹199)" — plus Prev/Next paging, ✅ marks owned
+💦 Buy    tapping an item goes STRAIGHT to the checkout: QR image, UPI id, exact amount,
+          order id note — and a single button: [I paid — submit screenshot]
 📸 Proof  the bot only accepts an actual photo/file — text is refused
 ⏳         "Proof received — waiting for admin approval"
-✅         video/document delivered + link buttons (join channel / group / open link) + added to 📚 library
+✅         video/document or channel/group link delivered instantly + added to 🍒 library
 ```
 Free items (`price = 0`) unlock instantly with no order. Optional `⏱ validity` per item auto-expires access.
 If `force channel join` is set, the customer must join before the bot works (make the bot an admin of that channel).
+
+### Premium emoji (custom emoji + colored buttons)
+
+The user side ships with **Telegram premium (custom) emoji** — animated 💦 🍑 🥵 🍭 🍆 🍒 🌸 😘 👅 😄 in
+messages (`<tg-emoji>`) and as **button icons** (`icon_custom_emoji_id`), plus **colored buttons**
+(`style`: `success` green / `primary` blue / `danger` red — Bot API 9.4). This needs the **bot owner to
+have Telegram Premium** (or a Fragment username on the bot). If Telegram ever rejects them, the bot
+automatically retries with plain emoji, so nothing breaks. Set `PREMIUM_EMOJI=0` to force plain emoji.
 
 ---
 
@@ -147,7 +154,8 @@ polling**, so no public URL or webhook is needed.
 
 | Where | What |
 |---|---|
-| top of `main.py` | `CURRENCY`, `PAGE_SIZE` (items per page), `STATE_TTL_HOURS`, `DEFAULTS` (all default texts) |
+| env `PREMIUM_EMOJI=0` | turn off premium custom emoji / button icons (plain emoji fallback) |
+| top of `main.py` | `PEMOJI` (premium emoji → id map), `CURRENCY`, `PAGE_SIZE` (items per page), `STATE_TTL_HOURS`, `DEFAULTS` (all default texts) |
 | `SCHEMA` / `add_item()` | add your own item fields (e.g. `offer_price`, `sample_file_id`) |
 | `item_caption()` | how the item page looks |
 | `deliver()` | how content is sent (file + link buttons + library footer) |
