@@ -51,8 +51,8 @@ python main.py
 
 ```bash
 python main.py --demo           # interactive simulator: the terminal becomes Telegram
-python main.py --selftest       # 102 checks over the whole lifecycle (SQLite backend)
-python main.py --selftest-mongo # the same 102 checks against the MongoDB backend
+python main.py --selftest       # 122 checks over the whole lifecycle (SQLite backend)
+python main.py --selftest-mongo # the same 122 checks against the MongoDB backend
 python main.py --apitest        # 16 checks: real HTTP calls verified against a fake Telegram server
 ```
 
@@ -118,29 +118,69 @@ checkout, so the amount and order id are already filled when the customer scans 
           bullets, TECH SUPPORT line, 👥🔥 counters the admin can set)
           + [Buy Premium Videos] [Free demo ↗] [Proofs ↗]
           [My profile] [Support] [How to use] — premium emoji icons + colored buttons
-/shop     every item is its own button — "Title (₹199)" — plus Prev/Next paging, ✅ marks owned
+/shop     every item is its own button — "Title (₹199)" — plus Prev/Next paging, 💦 marks owned
 💦 Buy    tapping an item goes STRAIGHT to the checkout: QR image, UPI id, exact amount,
           order id note — and a single button: [I paid — submit screenshot]
 📸 Proof  the bot only accepts an actual photo/file — text is refused
 ⏳         "Proof received — waiting for admin approval"
-✅         a professional PURCHASE SUCCESSFUL receipt: item, 💰 amount paid, 🧾 order id + date,
-          ♾️ access validity — the file (or [Open link · ₹199] buttons) + [My library] [Store]
+💦         a professional PURCHASE SUCCESSFUL receipt: item, 💦 amount paid, 🍒 order id + date,
+          💦 access validity — and the links written out in full (no hidden "Join channel" text):
+
+          🥵 PURCHASE SUCCESSFUL 💦
+          ──────────────────────────
+          🍆 Rody
+
+          💦 You paid: ₹400
+          🍒 Order ID: #0001 · 18 Sep, 11:16
+          💦 Access: Lifetime
+          ──────────────────────────
+          👅 Main link: https://t.me/yourchannel/123
+          👅 Channel: https://t.me/yourchannel
+
+          😘 Thank you for shopping with Premium Video!
+          Your content is ready — enjoy 💦
+          ▸ [Open link · ₹400] [Join channel · ₹400] [My library] [Buy something else]
 ```
 Free items (`price = 0`) unlock instantly with no order. Optional `⏱ validity` per item auto-expires access.
 If `force channel join` is set, the customer must join before the bot works (make the bot an admin of that channel).
 
 ### Premium emoji (custom emoji + colored buttons)
 
-**Both sides** ship with **Telegram premium (custom) emoji** — animated 💦 🍑 🥵 🍭 🍆 🍒 🌸 😘 👅 😄 on the
-user side and 📦 ⚙️ 💳 👥 ✅ ❌ 📣 📊 🖼 🎁 🚫… on the **admin side** — in messages (`<tg-emoji>`) and as
-**button icons** (`icon_custom_emoji_id`), plus **colored buttons** everywhere (`style`: `success`
-green / `primary` blue / `danger` red — Bot API 9.4). This needs the **bot owner to have Telegram
-Premium** (or a Fragment username on the bot). If Telegram ever rejects them, the bot automatically
-retries with plain emoji, so nothing breaks. Set `PREMIUM_EMOJI=0` to force plain emoji.
+Every message and every button icon uses **Telegram premium (custom) emoji** — in message text
+(`<tg-emoji>`) and as **button icons** (`icon_custom_emoji_id`), plus **colored buttons** everywhere
+(`style`: `success` green / `primary` blue / `danger` red — Bot API 9.4). This needs the **bot owner
+to have Telegram Premium** (or a Fragment username on the bot). `PREMIUM_EMOJI=0` forces plain emoji.
 
-**Emoji IDs** come from the `ADMIN PANEL EMOJI ID/` folder — every JSON `.txt` file there
-(`[{"emoji": "📦", "custom_emoji_id": "…"}]`) is loaded at startup and overrides the built-in set.
-Drop your own files in that folder (or edit the existing ones) to change any icon.
+**Customer side — only ten animated emoji, everywhere.** Whatever the screen, a buyer only ever sees:
+
+| emoji | used for | emoji | used for |
+|---|---|---|---|
+| 💦 | paid · success · instant · money | 🍒 | orders · library · receipt |
+| 🍑 | store · browse · price | 🍆 | video · item · file · content |
+| 🥵 | hot · premium · warning · locked | 🍭 | free · bonus · note · waiting |
+| 🌸 | profile · account · neutral | 😘 | thanks · support · friendly |
+| 👅 | links · external · preview | 😄 | help · how-to · welcome |
+
+Any other emoji is swapped for the closest one from this set automatically (`ue()` in `main.py`), so
+the shop can never look inconsistent again — this includes emoji that came from an item title.
+The admin's own **welcome text** and **broadcast text** go through the same swap, so even a
+message the owner typed by hand arrives in the shop's own animated set.
+
+**Admin side — no plain emoji left.** Admin screens use their own animated set (📦 ⚙️ 💳 👥 ✅ ❌ 📣 📊…)
+and every emoji that has no id in the folder gets a *similar* animated one instead
+(`ADMIN_EMOJI_FALLBACK` in `main.py`), so a panel never shows a static emoji next to animated ones.
+
+**Emoji IDs** come from the `ADMIN PANEL EMOJI ID/` folder — every JSON `.txt` / `.json` file there
+(`[{"emoji": "📦", "custom_emoji_id": "…"}]`) is read at startup:
+
+* a **normal file** (`KripanshEmojis…`, `ToastEmoji`, `tgiosicons`…) → admin + shared screens
+* a file whose name starts with **`UserSide`** (`UserSideEmojis.txt` = the owner's own list) →
+  the **customer side**, and it always wins over the other files, so the shop keeps exactly the
+  animated emoji you picked. Delete it and the built-in set in `main.py` is used instead.
+
+**If Telegram rejects a custom emoji** (bot lost Premium, stale id…) the message is retried once with
+plain emoji and then custom emoji stay off for `PREMIUM_EMOJI_COOLDOWN` seconds (default 600) — so a
+single rejection never turns into a per-message retry that makes the bot feel slow.
 
 ---
 
@@ -183,6 +223,10 @@ polling**, so no public URL or webhook is needed.
 |---|---|
 | env `MONGO_URI` / `MONGO_DB` | store everything in MongoDB instead of the local SQLite file (see section 1) |
 | env `PREMIUM_EMOJI=0` | turn off premium custom emoji / button icons (plain emoji fallback) |
+| env `PREMIUM_EMOJI_COOLDOWN` | seconds to stop sending custom emoji after Telegram rejects one (default 600, 0 = never back off) |
+| store caches | settings snapshot 60 s + access rows 5 s (`SETTINGS_TTL` / `UNLOCK_TTL` on the store class) — writes invalidate them instantly |
+| `PremiumBot.MEMBER_TTL` | how long a force-join check (`getChatMember`) is cached (default 120 s) |
+| `PremiumBot.SLOW_UPDATE` | log a `🐢 slow update` line when one update takes longer than this (default 2.5 s) |
 | top of `main.py` | `PEMOJI` (premium emoji → id map), `CURRENCY`, `PAGE_SIZE` (items per page), `STATE_TTL_HOURS`, `DEFAULTS` (all default texts) |
 | `SCHEMA` / `add_item()` | add your own item fields (e.g. `offer_price`, `sample_file_id`) |
 | `item_caption()` | how the item page looks |
@@ -193,6 +237,13 @@ storage cost). Bot upload limit is 50 MB — bigger items: sell the channel/driv
 `/api.telegram.org` must be reachable from the server running the bot. The storage layer is pluggable
 (`SQLiteStore` / `MongoStore` at the top of `main.py`) — every screen works identically on both backends.
 
+**Speed (why it feels fast):** one keep-alive `requests.Session` for all Telegram calls (no fresh TLS
+handshake per message), a cached settings snapshot instead of 5-10 setting queries per screen, cached
+access rows, a cached force-join check (no `getChatMember` on every tap), one shared SQLite connection
+(WAL + `synchronous=NORMAL`) or one settings/access cache for MongoDB, and the premium-emoji cooldown
+above. If a reply still feels slow, the log prints `🐢 slow update took 3.1s` — that is the network to
+Telegram (or a far-away MongoDB), not the bot logic.
+
 ## 6. Troubleshooting
 
 | Symptom | Fix |
@@ -202,6 +253,9 @@ storage cost). Bot upload limit is 50 MB — bigger items: sell the channel/driv
 | customer got no content after approval | they blocked the bot — the admin sees a "Delivery failed" notice, use 🔁 Re-deliver later |
 | QR image missing at checkout | `pip install qrcode pillow`, or upload your own with **💳 Payment setup → 🖼 Upload QR** |
 | stuck in a wizard step | `/cancel` (customer) or `/unstick <telegram id>` (admin) |
+| bot replies feel slow | check `🐢 slow update` lines in the log; keep-alive + the caches above are already on — a VPS closer to Telegram (or SQLite instead of a distant MongoDB) is the next step |
+| emoji show as plain ones | the bot owner needs Telegram Premium (or a Fragment username); after a rejection the bot goes plain for `PREMIUM_EMOJI_COOLDOWN` seconds |
+| but I want the old hidden "Join channel" link | `deliver()` in `main.py` — the `link_lines` block is the only place that decides how links are printed |
 
 ```bash
 python main.py --selftest && python main.py --apitest     # both green ⇒ the bot is healthy

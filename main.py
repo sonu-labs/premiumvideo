@@ -18,13 +18,14 @@ RUN
 
 TEST WITHOUT A TOKEN
   python main.py --demo           # the terminal becomes Telegram (drive admin + user accounts)
-  python main.py --selftest       # 102 automated checks of the whole purchase lifecycle (SQLite)
-  python main.py --selftest-mongo # the same 102 checks against the MongoDB backend
+  python main.py --selftest       # 122 automated checks of the whole purchase lifecycle (SQLite)
+  python main.py --selftest-mongo # the same 122 checks against the MongoDB backend
   python main.py --apitest        # verifies the real HTTP layer against a fake Telegram server
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import html
 import json
 import os
@@ -247,10 +248,26 @@ _LOCK = threading.RLock()
 _TABLES = ("users", "items", "orders", "unlocks", "settings", "states")
 
 
+_SQLITE_CONN = None
+
+
 def _sqlite_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, timeout=30)
+    """One shared connection (the bot is single threaded and every call is under _LOCK):
+    opening a new file + PRAGMA on every single query was pure overhead."""
+    global _SQLITE_CONN
+    if _SQLITE_CONN is not None:
+        if getattr(_SQLITE_CONN, "database", DB_PATH) == DB_PATH:
+            return _SQLITE_CONN
+        try:
+            _SQLITE_CONN.close()
+        except Exception:
+            pass
+        _SQLITE_CONN = None
+    conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")        # safe with WAL, much faster
+    _SQLITE_CONN = conn
     return conn
 
 
@@ -260,42 +277,63 @@ def _sqlite_conn() -> sqlite3.Connection:
 class SQLiteStore:
     name = "sqlite"
 
+    SETTINGS_TTL = 60          # seconds a settings snapshot is reused
+    UNLOCK_TTL = 5             # seconds an access row is reused
+
     def init(self):
+        global _SQLITE_CONN
         with _LOCK:
+            if _SQLITE_CONN is not None:
+                try:
+                    _SQLITE_CONN.close()
+                except Exception:
+                    pass
+                _SQLITE_CONN = None
+            self._settings_cache = None
+            self._unlock_cache = {}
             conn = _sqlite_conn()
             conn.executescript(SCHEMA)
             conn.commit()
-            conn.close()
 
     def _q(self, sql, args=()):
         with _LOCK:
-            conn = _sqlite_conn()
             try:
-                return [dict(r) for r in conn.execute(sql, args).fetchall()]
-            finally:
-                conn.close()
+                return [dict(r) for r in _sqlite_conn().execute(sql, args).fetchall()]
+            except sqlite3.Error:
+                globals().pop("_SQLITE_CONN", None)
+                raise
 
     def _x(self, sql, args=()):
         with _LOCK:
-            conn = _sqlite_conn()
             try:
-                cur = conn.execute(sql, args)
-                conn.commit()
+                cur = _sqlite_conn().execute(sql, args)
+                _sqlite_conn().commit()
                 return cur.lastrowid
-            finally:
-                conn.close()
+            except sqlite3.Error:
+                globals().pop("_SQLITE_CONN", None)
+                raise
 
     # ------------------------------ settings ------------------------------
+    def settings_map(self) -> dict:
+        """Whole settings table, cached for SETTINGS_TTL seconds — every screen asks
+        for 5-10 settings, that was 5-10 database round trips per message."""
+        c = getattr(self, "_settings_cache", None)
+        if c and time.time() - c[0] < self.SETTINGS_TTL:
+            return c[1]
+        d = {r["key"]: r["value"] for r in self._q("SELECT key,value FROM settings")}
+        self._settings_cache = (time.time(), d)
+        return d
+
     def setting_get(self, key):
-        r = self._q("SELECT value FROM settings WHERE key=?", (key,))
-        return r[0]["value"] if r else None
+        return self.settings_map().get(key)
 
     def setting_set(self, key, value):
         self._x("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 (key, value or ""))
+        self._settings_cache = None
 
     def settings_rows(self):
-        return self._q("SELECT key,value FROM settings")
+        return [{"key": k, "value": v} for k, v in self.settings_map().items()]
 
     # ------------------------------ states --------------------------------
     def state_get(self, tg_id):
@@ -509,16 +547,27 @@ class SQLiteStore:
 
     # ------------------------------ unlocks -------------------------------
     def unlock_upsert(self, uid, item_id, order_id, expires_at):
+        self._unlock_cache = {}
         self._x("""INSERT INTO unlocks(user_id,item_id,order_id,created_at,expires_at) VALUES(?,?,?,?,?)
                    ON CONFLICT(user_id,item_id) DO UPDATE SET expires_at=excluded.expires_at,
                    order_id=excluded.order_id, created_at=excluded.created_at""",
                 (int(uid), int(item_id), order_id, now(), expires_at))
 
     def unlock_get(self, uid, item_id):
-        r = self._q("SELECT * FROM unlocks WHERE user_id=? AND item_id=?", (int(uid), int(item_id)))
-        return r[0] if r else None
+        key = (int(uid), int(item_id))
+        c = getattr(self, "_unlock_cache", None)
+        if c is None:
+            c = self._unlock_cache = {}
+        hit = c.get(key)
+        if hit and time.time() - hit[0] < self.UNLOCK_TTL:
+            return hit[1]
+        r = self._q("SELECT * FROM unlocks WHERE user_id=? AND item_id=?", key)
+        out = r[0] if r else None
+        c[key] = (time.time(), out)
+        return out
 
     def unlock_delete(self, uid, item_id):
+        self._unlock_cache = {}
         self._x("DELETE FROM unlocks WHERE user_id=? AND item_id=?", (int(uid), int(item_id)))
 
     def count_unlocks(self, uid):
@@ -539,6 +588,8 @@ class SQLiteStore:
         return self._q(f"SELECT * FROM {table} LIMIT ?", (int(limit),))
 
     def reset_all(self):
+        self._settings_cache = None
+        self._unlock_cache = {}
         for t in _TABLES:
             self._x(f"DELETE FROM {t}")
 
@@ -576,8 +627,12 @@ class MongoStore:
         self.d.settings.create_index("key", unique=True)
         self.d.states.create_index("user_id", unique=True)
 
+    SETTINGS_TTL = 60          # seconds a settings snapshot is reused
+    UNLOCK_TTL = 5             # seconds an access row is reused
+
     def init(self):
-        pass                                        # indexes created in __init__
+        self._settings_cache = None
+        self._unlock_cache = {}
 
     def _next_id(self, coll):
         doc = self.d.counters.find_one_and_update({"_id": coll}, {"$inc": {"seq": 1}},
@@ -593,15 +648,25 @@ class MongoStore:
         return out
 
     # ------------------------------ settings ------------------------------
+    def settings_map(self) -> dict:
+        """Cached whole settings table — with MongoDB every uncached setting() call is a
+        network round trip to Atlas (30-80 ms), and each screen reads 5-10 of them."""
+        c = getattr(self, "_settings_cache", None)
+        if c and time.time() - c[0] < self.SETTINGS_TTL:
+            return c[1]
+        d = {r["key"]: r.get("value") for r in self.d.settings.find({})}
+        self._settings_cache = (time.time(), d)
+        return d
+
     def setting_get(self, key):
-        doc = self.d.settings.find_one({"key": key})
-        return doc.get("value") if doc else None
+        return self.settings_map().get(key)
 
     def setting_set(self, key, value):
         self.d.settings.update_one({"key": key}, {"$set": {"value": value or ""}}, upsert=True)
+        self._settings_cache = None
 
     def settings_rows(self):
-        return [{"key": r["key"], "value": r.get("value")} for r in self.d.settings.find({})]
+        return [{"key": k, "value": v} for k, v in self.settings_map().items()]
 
     # ------------------------------ states --------------------------------
     def state_get(self, tg_id):
@@ -846,14 +911,25 @@ class MongoStore:
 
     # ------------------------------ unlocks -------------------------------
     def unlock_upsert(self, uid, item_id, order_id, expires_at):
+        self._unlock_cache = {}
         self.d.unlocks.update_one({"user_id": int(uid), "item_id": int(item_id)},
                                   {"$set": {"order_id": order_id, "created_at": now(),
                                             "expires_at": expires_at}}, upsert=True)
 
     def unlock_get(self, uid, item_id):
-        return self._row(self.d.unlocks.find_one({"user_id": int(uid), "item_id": int(item_id)}), _UNLOCK_DEF)
+        key = (int(uid), int(item_id))
+        c = getattr(self, "_unlock_cache", None)
+        if c is None:
+            c = self._unlock_cache = {}
+        hit = c.get(key)
+        if hit and time.time() - hit[0] < self.UNLOCK_TTL:
+            return hit[1]
+        out = self._row(self.d.unlocks.find_one({"user_id": key[0], "item_id": key[1]}), _UNLOCK_DEF)
+        c[key] = (time.time(), out)
+        return out
 
     def unlock_delete(self, uid, item_id):
+        self._unlock_cache = {}
         self.d.unlocks.delete_one({"user_id": int(uid), "item_id": int(item_id)})
 
     def count_unlocks(self, uid):
@@ -893,6 +969,8 @@ class MongoStore:
         return out
 
     def reset_all(self):
+        self._settings_cache = None
+        self._unlock_cache = {}
         for t in _TABLES:
             self.d[t].delete_many({})
         self.d.counters.delete_many({})
@@ -934,46 +1012,73 @@ def init_db(force_sqlite: bool = False):
 # Works when the bot owner has Telegram Premium or the bot has a Fragment username.
 # Set PREMIUM_EMOJI=0 to fall back to plain unicode emoji everywhere.
 #
-# IDs come from TWO places:
-#   1. the hardcoded base set below (user-side animated emoji)
-#   2. every JSON file in the "ADMIN PANEL EMOJI ID/" folder — these are loaded at
-#      startup and OVERRIDE the base set, so admins can drop in their own ids there.
+# IDs come from the "ADMIN PANEL EMOJI ID/" folder — every JSON .txt / .json file in it
+# is read at startup:
+#   * a normal file              -> admin + shared screens (drop your own file in to tweak)
+#   * a file named "UserSide*"   -> the CUSTOMER side. This set ALWAYS wins over the
+#                                   other files, so the shop keeps exactly these
+#                                   animated emoji on every screen a buyer sees.
+# Folder missing/deleted? The built-in sets below are used, nothing breaks.
 PREMIUM_EMOJI = os.environ.get("PREMIUM_EMOJI", "1").strip().lower() not in ("0", "false", "no", "off")
+# When Telegram rejects a custom emoji (bot lost Premium, stale id, …) the message is
+# retried once with plain emoji and then custom emoji stay off for this many seconds.
+# Retrying on *every* message is what makes a bot feel slow.
+PREMIUM_EMOJI_COOLDOWN = max(0, int(os.environ.get("PREMIUM_EMOJI_COOLDOWN", "600") or 600))
 
 EMOJI_ID_DIR = os.path.join(ROOT, "ADMIN PANEL EMOJI ID")
+USER_EMOJI_FILE_PREFIX = "userside"        # "UserSideEmojis.txt" -> customer-side ids
 
 
-def _load_repo_emoji_ids() -> dict:
-    """Load emoji → custom_emoji_id from every JSON .txt in EMOJI_ID_DIR.
-    First occurrence wins; both '⚙' and '⚙️' (variation selector) forms map to the id."""
-    out = {}
+def _read_emoji_file(path: str) -> list:
+    """[{"emoji": "📦", "custom_emoji_id": "…"}] -> [("📦", "…")] — file order kept."""
     try:
-        names = sorted(os.listdir(EMOJI_ID_DIR))
-    except OSError:
-        return out
-    for fn in names:
-        if not fn.lower().endswith((".txt", ".json")):
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        return []
+    out = []
+    for row in data if isinstance(data, list) else []:
+        if not isinstance(row, dict):
             continue
-        try:
-            with open(os.path.join(EMOJI_ID_DIR, fn), encoding="utf-8") as fh:
-                data = json.load(fh)
-        except Exception:
-            continue
-        for row in data if isinstance(data, list) else []:
-            if not isinstance(row, dict):
-                continue
-            e = row.get("emoji")
-            i = row.get("custom_emoji_id") or row.get("id")
-            if not (e and i):
-                continue
-            i = str(i)
-            for variant in {e, e + "\ufe0f", e.replace("\ufe0f", "")}:
-                out.setdefault(variant, i)
+        e = row.get("emoji")
+        i = row.get("custom_emoji_id") or row.get("id")
+        if e and i:
+            out.append((str(e), str(i)))
     return out
 
 
-PEMOJI = {  # emoji char -> custom_emoji_id (fallback char stays inside the tag)
-    # ---- user side (animated premium emoji) ----
+def _variants(e: str) -> set:
+    """'⚙' and '⚙️' (variation selector) must resolve to the same id."""
+    return {e, e + "\ufe0f", e.replace("\ufe0f", "")}
+
+
+def _load_repo_emoji_ids() -> tuple:
+    """Read EMOJI_ID_DIR -> (shared, customer).
+    First id wins inside a group; "UserSide*" files always beat the other files."""
+    shared, customer = {}, {}
+    try:
+        names = sorted(os.listdir(EMOJI_ID_DIR))
+    except OSError:
+        return shared, customer
+    for fn in names:
+        if not fn.lower().endswith((".txt", ".json")):
+            continue
+        rows = _read_emoji_file(os.path.join(EMOJI_ID_DIR, fn))
+        if not rows:
+            continue
+        bucket = customer if fn.lower().startswith(USER_EMOJI_FILE_PREFIX) else shared
+        for e, i in rows:
+            for v in _variants(e):
+                bucket.setdefault(v, i)
+    return shared, customer
+
+
+SHARED_EMOJI, USER_EMOJI = _load_repo_emoji_ids()
+
+# Customer side — the ten animated emoji used on EVERY screen a buyer sees. These ids
+# are the first id of each emoji in the owner's list (the ones already proven to work);
+# to change them drop a "UserSideEmojis.txt" (same JSON) into the folder above.
+USER_EMOJI_BASE = {
     "💦": "6310096377107975749",
     "🍑": "6311843256271376001",
     "🥵": "6307832826263768178",
@@ -985,24 +1090,175 @@ PEMOJI = {  # emoji char -> custom_emoji_id (fallback char stays inside the tag)
     "👅": "6311998326065597286",
     "😄": "6332146103550479433",
 }
-# admin/shared side ids come from the repo folder (drop your own files there to change them)
-PEMOJI.update(_load_repo_emoji_ids())
+for _e, _i in USER_EMOJI_BASE.items():
+    for _v in _variants(_e):
+        USER_EMOJI.setdefault(_v, _i)
+
+# Admin / shared screens: emoji the folder has no id for borrow a similar animated one,
+# so the panel never shows a plain emoji next to the animated ones.
+ADMIN_EMOJI_FALLBACK = {
+    "🎬": "🎥", "🧾": "📄", "📜": "📄", "🛒": "🛍", "🛠": "🔧", "⏳": "⌛", "⏱": "⏲",
+    "⏸": "⏰", "⏭": "⏩", "🆔": "👤", "🟢": "✅", "🔙": "⬅️", "◀": "⬅️", "←": "⬅️",
+    "→": "➡️", "👇": "⬇️", "▪": "🔸", "↳": "➡️", "🍃": "🌐",
+}
+
+PEMOJI = dict(SHARED_EMOJI)          # admin + shared ids first …
+for _e, _like in ADMIN_EMOJI_FALLBACK.items():
+    _i = next((PEMOJI[v] for v in _variants(_like) if v in PEMOJI), None)
+    if _i:
+        for _v in _variants(_e):
+            PEMOJI.setdefault(_v, _i)
+PEMOJI.update(USER_EMOJI)            # … the customer set always wins
+
 _TG_EMOJI_RE = re.compile(r'<tg-emoji emoji-id="\d+">(.*?)</tg-emoji>')
+
+
+def text_len(s: str) -> int:
+    """Visible length — Telegram does not count the <tg-emoji> wrappers."""
+    return len(_TG_EMOJI_RE.sub(lambda m: m.group(1), s or ""))
+
+
+def split_visible(s: str, limit: int) -> tuple:
+    """(head, tail) cut at `limit` visible characters — never inside a <tg-emoji> tag."""
+    s = s or ""
+    if text_len(s) <= limit:
+        return s, ""
+    out, n, pos = [], 0, 0
+    for m in _TG_EMOJI_RE.finditer(s):
+        for ch in s[pos:m.start()]:
+            n += 1
+            if n > limit:
+                return "".join(out), s[m.start():]
+            out.append(ch)
+        out.append(m.group(0))
+        n += 1
+        pos = m.end()
+    for ch in s[pos:]:
+        n += 1
+        if n > limit:
+            return "".join(out), s[pos + (n - 1):]
+        out.append(ch)
+    return "".join(out), ""
+
+
+def clip_visible(s: str, limit: int) -> str:
+    head, tail = split_visible(s, limit)
+    return head + ("…" if tail else "")
+
+# ---------------------------------------------------------------------------
+# Customer-side look: only the ten animated emoji above are used on every screen a
+# buyer sees. Everything else is swapped for the closest one from the set — the shop
+# stays 100% consistent even where the emoji does not really "match".
+# legend: 💦 paid/instant · 🍑 store/price · 🍒 orders/library · 🍆 video/item ·
+#         🥵 hot/warning · 🍭 free/note · 🌸 profile · 😘 support · 👅 links · 😄 help
+# ---------------------------------------------------------------------------
+USER_EMOJI_SWAP = {
+    # success / money / instant
+    "✅": "💦", "☑️": "💦", "✔️": "💦", "🎉": "💦", "✨": "💦", "♾️": "💦", "♾": "💦",
+    "🔓": "💦", "📤": "💦", "📥": "💦", "💰": "💦", "💵": "💦", "💸": "💦", "💳": "💦",
+    "🪙": "💦", "🏧": "💦", "🎊": "💦",
+    # store / price / search
+    "🛒": "🍑", "🛍": "🍑", "🏪": "🍑", "🏷": "🍑", "🔍": "🍑",
+    # orders / library / receipt / lists
+    "🧾": "🍒", "📚": "🍒", "📖": "🍒", "📄": "🍒", "📜": "🍒", "🔁": "🍒", "🗂": "🍒",
+    "📁": "🍒", "📂": "🍒", "💼": "🍒", "📋": "🍒", "🗒": "🍒",
+    # video / item / file / content
+    "📦": "🍆", "🎥": "🍆", "🎞": "🍆", "📹": "🍆", "▶️": "🍆", "▶": "🍆", "📺": "🍆",
+    "🎵": "🍆", "🎶": "🍆", "🎮": "🍆",
+    # hot / exclusive / warning / locked
+    "❌": "🥵", "⚠️": "🥵", "⚠": "🥵", "🔒": "🥵", "🚫": "🥵", "⛔️": "🥵", "⛔": "🥵",
+    "⏸️": "🥵", "⏸": "🥵", "🗑": "🥵", "🗑️": "🥵", "🚨": "🥵", "🏆": "🥵", "💎": "🥵",
+    "⚡": "🥵", "🔥": "🥵", "🤖": "🥵", "🖼": "🥵", "🖼️": "🥵", "📸": "🥵", "📊": "🥵",
+    "🎬": "🥵", "🔐": "🥵", "🆘": "🥵", "💥": "🥵",
+    # free / note / waiting
+    "🎁": "🍭", "🆓": "🍭", "⏳": "🍭", "⌛": "🍭", "⌛️": "🍭", "⏱️": "🍭", "⏱": "🍭",
+    "📝": "🍭", "💡": "🍭", "🔔": "🍭", "⏰": "🍭", "📅": "🍭", "🗓": "🍭", "🎫": "🍭",
+    # profile / account / neutral
+    "👤": "🌸", "🆔": "🌸", "🗓️": "🌸", "🙂": "🌸", "😊": "🌸", "🏠": "🌸", "⚙️": "🌸",
+    "⚙": "🌸", "🛠": "🌸", "🚀": "🌸", "🎯": "🌸", "🆕": "🌸", "👋": "🌸", "🙋": "🌸",
+    # support / thanks
+    "🙏": "😘", "❤️": "😘", "❤": "😘", "🫂": "😘", "💬": "😘", "🤝": "😘", "☎️": "😘",
+    "📞": "😘",
+    # links / external / pointers
+    "📢": "👅", "📣": "👅", "🔗": "👅", "👇": "👅", "⬇️": "👅", "⬇": "👅", "🌐": "👅",
+    "🌎": "👅", "📱": "👅", "🎙": "👅", "🎤": "👅",
+    # help / steps / playful
+    "❓": "😄", "🤔": "😄", "😀": "😄", "😃": "😄", "1️⃣": "😄", "2️⃣": "😄",
+    "3️⃣": "😄", "4️⃣": "😄", "5️⃣": "😄", "🤫": "😄", "🙃": "😄",
+    # a few leftovers seen in older texts
+    "👥": "🍑", "🌟": "💦", "💫": "💦", "⭐": "💦", "⭐️": "💦", "💕": "😘", "💖": "😘",
+    "🔑": "🥵", "🗝": "🥵", "🧲": "🍆", "📌": "🍒", "📍": "🌸", "🗺": "👅", "🌍": "👅",
+    "💭": "😄", "🙈": "😄", "🕐": "🍭", "🕒": "🍭", "🕔": "🍭", "🔢": "😄", "🔤": "😄",
+    "©": "🌸", "®": "🌸", "™": "🌸", "↔️": "😄", "↩️": "🥵", "➡️": "👅", "⬅️": "🥵",
+    "⬆️": "👅", "🔼": "👅", "🔽": "👅", "⏫": "👅", "⏬": "👅", "ℹ️": "🍭", "ℹ": "🍭",
+    "🅰": "🌸", "🆗": "💦", "🆙": "👅", "🔝": "👅", "🈲": "🥵", "🚀️": "🌸",
+    "💤": "🍭", "😴": "🍭", "🥶": "🥵", "😍": "🥵", "😋": "😘", "🤩": "🥵", "🥳": "💦",
+    "😎": "🥵", "🤗": "😘", "😇": "🌸", "😉": "😘", "😌": "🌸", "😭": "🥵", "😢": "🥵",
+    "😡": "🥵", "😤": "🥵", "😱": "🥵", "🤯": "🥵", "🫡": "😘", "👍": "💦", "👏": "💦",
+    "🙌": "💦", "🤝️": "😘", "✌️": "😄", "✌": "😄", "🤞": "🍭", "🙏️": "😘",
+    "🕵": "🥵", "🕵️": "🥵", "🧐": "😄", "🙄": "😄", "😐": "😄", "😑": "😄",
+}
+_UE_RE = re.compile("|".join([_TG_EMOJI_RE.pattern] +
+                             [re.escape(k) for k in sorted(USER_EMOJI_SWAP, key=len, reverse=True)]))
+
+# any emoji-ish character — used by the self-test to prove the shop stays on the
+# curated set and that no admin screen is left with a plain emoji
+ANY_EMOJI_RE = re.compile(
+    "[#*0-9]\ufe0f?\u20e3|[\U0001F000-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF\u2190-\u21FF"
+    "\u2900-\u297F\u2300-\u23FF\u25A0-\u25FF\u00A9\u00AE\u203C\u2049\u20E3\u3030\u303D"
+    "\u3297\u3299]")
+
+# runtime switch — flipped off for PREMIUM_EMOJI_COOLDOWN seconds after a rejection
+_premium_off_until = 0.0
+
+
+def premium_emoji_on() -> bool:
+    """True while <tg-emoji> / button icons may be sent."""
+    return bool(PREMIUM_EMOJI) and time.time() >= _premium_off_until
+
+
+def premium_emoji_off(reason: str = ""):
+    """Telegram said no to a custom emoji — stop paying for the retry on every message."""
+    global _premium_off_until
+    if not (PREMIUM_EMOJI and PREMIUM_EMOJI_COOLDOWN):
+        return
+    first = _premium_off_until == 0.0
+    _premium_off_until = time.time() + PREMIUM_EMOJI_COOLDOWN
+    if first:
+        log(f"⚠️ Telegram rejected a premium emoji{(' — ' + reason) if reason else ''}. "
+            f"Plain emoji for the next {PREMIUM_EMOJI_COOLDOWN}s "
+            f"(PREMIUM_EMOJI=0 turns them off for good).")
 
 
 _PE_RE = None
 
 
 def pe(text: str) -> str:
-    """Swap every mapped emoji char for its premium <tg-emoji> version (user-facing texts).
-    Single regex pass (longest match first) so an emoji can never be replaced twice."""
+    """Swap every mapped emoji char for its premium <tg-emoji> version (admin/shared
+    texts). Safe to call twice — already wrapped emoji are left alone."""
     global _PE_RE
-    if not (PREMIUM_EMOJI and text):
+    if not (premium_emoji_on() and text and PEMOJI):
         return text
     if _PE_RE is None:
         keys = sorted(PEMOJI, key=len, reverse=True)
-        _PE_RE = re.compile("|".join(re.escape(k) for k in keys))
-    return _PE_RE.sub(lambda m: f'<tg-emoji emoji-id="{PEMOJI[m.group(0)]}">{m.group(0)}</tg-emoji>', text)
+        _PE_RE = re.compile("|".join([_TG_EMOJI_RE.pattern] + [re.escape(k) for k in keys]))
+    return _PE_RE.sub(lambda m: m.group(0) if m.group(0).startswith("<tg-emoji")
+                      else f'<tg-emoji emoji-id="{PEMOJI[m.group(0)]}">{m.group(0)}</tg-emoji>', text)
+
+
+def ue(text: str) -> str:
+    """Customer-side emoji: everything is swapped for the curated animated set.
+    Tip: this is the only place a buyer-facing emoji is chosen, so the shop can never
+    show a random emoji again — see USER_EMOJI_SWAP."""
+    if not text:
+        return text
+    return _UE_RE.sub(lambda m: m.group(0) if m.group(0).startswith("<tg-emoji")
+                      else USER_EMOJI_SWAP.get(m.group(0), m.group(0)), text)
+
+
+def upe(text: str) -> str:
+    """Customer-side text = curated emoji set + premium wrapping."""
+    return pe(ue(text))
 
 
 # ------------------------------- settings ---------------------------------
@@ -1039,10 +1295,11 @@ def set_setting(key: str, value: str):
 
 
 def all_settings() -> dict:
+    """One cached snapshot instead of one query per key (see STORE.settings_map)."""
     d = dict(DEFAULTS)
-    for r in STORE.settings_rows():
-        if r["value"]:
-            d[r["key"]] = r["value"]
+    for k, v in STORE.settings_map().items():
+        if v:
+            d[k] = v
     return d
 
 
@@ -1149,12 +1406,44 @@ def set_state(tg_id: int, data: dict):
 # ==========================================================================
 # TRANSPORT  (requests if available, otherwise urllib — same behaviour)
 # ==========================================================================
+_HTTP = None            # one keep-alive session for the whole process
+_HTTP_LOCK = threading.Lock()
+
+
+def _session():
+    """A single requests.Session: every Telegram call reuses the same TLS connection
+    instead of doing a fresh handshake (that handshake was the biggest chunk of the
+    "why is the bot slow" delay)."""
+    global _HTTP
+    if _HTTP is None:
+        with _HTTP_LOCK:
+            if _HTTP is None:
+                s = requests.Session()
+                try:
+                    from requests.adapters import HTTPAdapter
+                    try:
+                        from urllib3.util.retry import Retry
+                    except Exception:                       # very old urllib3
+                        from requests.packages.urllib3.util.retry import Retry
+                    s.mount("https://", HTTPAdapter(
+                        pool_connections=4, pool_maxsize=8, max_retries=Retry(
+                            total=2, connect=2, read=0, status=2, backoff_factor=0.4,
+                            status_forcelist=(429, 500, 502, 503, 504),
+                            allowed_methods=frozenset(["POST"]),
+                            respect_retry_after_header=True)))
+                    s.mount("http://", s.adapters["https://"])
+                except Exception:
+                    pass
+                _HTTP = s
+    return _HTTP
+
+
 def http_post(url: str, fields: dict, files: dict | None = None):
     """POST as multipart/form-data (when files are present) or x-www-form-urlencoded."""
     fields = {k: ("" if v is None else str(v)) for k, v in (fields or {}).items()}
     if requests is not None:
         ff = {k: (v[0], v[1], v[2]) for k, v in files.items()} if files else None
-        r = requests.post(url, data=fields, files=ff, timeout=90)
+        r = _session().post(url, data=fields, files=ff, timeout=(10, 90))
         return r.status_code, r.text
     import urllib.request
     if files:
@@ -1225,9 +1514,8 @@ class Bot:
                 # Premium-emoji safety net: if the server rejects <tg-emoji> / button icons
                 # (e.g. owner lost Premium), retry once with everything stripped back to
                 # plain unicode emoji so the message still goes out.
-                flat = json.dumps(params, ensure_ascii=False)
                 if "tg-emoji" in str(params.get("text", "")) + str(params.get("caption", "")) \
-                        or "icon_custom_emoji_id" in flat:
+                        or "icon_custom_emoji_id" in json.dumps(params, ensure_ascii=False):
                     params2 = dict(params)
                     for k in ("text", "caption"):
                         if params2.get(k):
@@ -1241,7 +1529,7 @@ class Bot:
                             params2["reply_markup"] = json.dumps(rm, ensure_ascii=False)
                         except Exception:
                             pass
-                    log("premium emoji rejected — retrying with plain emoji")
+                    premium_emoji_off("Telegram rejected the custom emoji")
                     try:
                         code, body = http_post(api_url(method), params2, files)
                         return json.loads(body or "{}")
@@ -1258,7 +1546,7 @@ class Bot:
         head = f"→ chat {p.get('chat_id')}"
         head += {"sendPhoto": " 📷 photo", "sendVideo": " 🎬 video", "sendDocument": " 📄 document",
                  "upload->photo": " 📷 photo (upload)"}.get(m, "")
-        txt = p.get("text") or p.get("caption") or "(attachment only)"
+        txt = _TG_EMOJI_RE.sub(r"\1", p.get("text") or p.get("caption") or "(attachment only)")
         print(f"{self.label} ── {head}")
         for line in str(txt).splitlines():
             print("  │ " + line)
@@ -1272,7 +1560,9 @@ class Bot:
 
     # -------------------------------- helpers ------------------------------
     def send(self, chat_id, text, kbd=None):
-        return self.api("sendMessage", {"chat_id": chat_id, "text": (text or "")[:4000],
+        """pe() here as well: whatever the caller sends, a mapped emoji becomes the
+        animated premium one — no screen can be left behind with a plain emoji."""
+        return self.api("sendMessage", {"chat_id": chat_id, "text": clip_visible(pe(text or ""), 4000),
                                        "parse_mode": "HTML", "disable_web_page_preview": True,
                                        "reply_markup": kbd})
 
@@ -1284,7 +1574,7 @@ class Bot:
         field = "document" if method == "sendDocument" else kind
         params = {"chat_id": chat_id, field: file_id}
         if method not in ("sendVideoNote", "sendSticker"):
-            params["caption"] = (caption or "")[:1000]
+            params["caption"] = clip_visible(pe(caption or ""), 1000)
             params["parse_mode"] = "HTML"
         if kbd:
             params["reply_markup"] = kbd
@@ -1309,7 +1599,7 @@ class Bot:
             log(f"upload read failed: {e}")
             return {"ok": False}
         ctype = "image/png" if path.lower().endswith(".png") else "application/octet-stream"
-        return self.api(method, {"chat_id": chat_id, "caption": (caption or "")[:1000], "parse_mode": "HTML"},
+        return self.api(method, {"chat_id": chat_id, "caption": clip_visible(pe(caption or ""), 1000), "parse_mode": "HTML"},
                         files={field: (os.path.basename(path), data, ctype)})
 
     def download(self, file_id, dest_dir=DATA_DIR):
@@ -1343,7 +1633,7 @@ def btn(text, data=None, url=None, style=None, icon=None):
 def ubtn(label, data=None, url=None, icon=None, style=None):
     """User-side button: premium icon + color style.
     Without premium emoji the plain unicode emoji char is kept in the label."""
-    if icon and PREMIUM_EMOJI and icon in PEMOJI:
+    if icon and premium_emoji_on() and icon in PEMOJI:
         return btn(label, data, url, style=style, icon=icon)
     if icon and icon not in label:
         label = f"{icon} {label}"
@@ -1373,7 +1663,7 @@ def kb(button_rows):
                 b["url"] = u
             if style:
                 b["style"] = style
-            if icon and PREMIUM_EMOJI and icon in PEMOJI:
+            if icon and premium_emoji_on() and icon in PEMOJI:
                 b["icon_custom_emoji_id"] = PEMOJI[icon]
             line.append(b)
         out.append(line)
@@ -1394,7 +1684,9 @@ def make_upi_qr(amount, order_no, upi_id, payee, note) -> str | None:
     if order_no:
         params["tr"] = str(order_no).replace("#", "")
     uri = "upi://pay?" + urllib.parse.urlencode(params)
-    path = os.path.join(DATA_DIR, f"qr_{abs(hash(uri)) % 10**8}.png")
+    path = os.path.join(DATA_DIR, "qr_" + hashlib.md5(uri.encode("utf-8")).hexdigest()[:16] + ".png")
+    if os.path.exists(path):                      # already generated — reuse it
+        return path
     try:
         qrcode.make(uri).save(path)
         return path
@@ -1426,14 +1718,20 @@ SET_LABELS = {"brand": "Brand name", "upi_id": "UPI ID", "payee_name": "Payee na
 
 
 class PremiumBot:
+    MEMBER_TTL = 120          # seconds a "user joined the force-join channel" answer is kept
+
     def __init__(self, bot: Bot):
         self.bot = bot
         self.offset = 0
+        self._member_cache = {}
 
     # ======================================================================
     # UPDATE ROUTING
     # ======================================================================
+    SLOW_UPDATE = 2.5          # seconds — anything slower is logged for the operator
+
     def handle_update(self, update: dict):
+        t0 = time.time()
         try:
             if "callback_query" in update:
                 return self.on_callback(update["callback_query"])
@@ -1442,6 +1740,10 @@ class PremiumBot:
                 return self.on_message(m)
         except Exception:
             log("update handling failed:\n" + traceback.format_exc())
+        finally:
+            took = time.time() - t0
+            if took > self.SLOW_UPDATE:
+                log(f"🐢 slow update took {took:.1f}s — check the network / DB latency to Telegram")
 
     def on_message(self, m: dict):
         frm = m.get("from") or {}
@@ -1458,7 +1760,7 @@ class PremiumBot:
 
         if chat_type in ("group", "supergroup", "channel"):
             if text.startswith("/start"):
-                self.bot.send(chat_id, "I only work in private chats — open my DM and send /start.")
+                self.bot.send(chat_id, upe("🌸 I only work in private chats — open my DM and send /start."))
             return
 
         if not ADMIN_IDS:
@@ -1468,9 +1770,9 @@ class PremiumBot:
 
         if not admin and is_blocked(tg_id):
             return self.bot.send(chat_id,
-                                 "🚫 Your access has been suspended by the administrator.\n"
-                                 "Please contact the admin for help.",
-                                 kb(rows([btn("💬 Message admin", "contact_admin")])))
+                                 upe("🥵 Your access has been suspended by the administrator.\n"
+                                     "Please contact the admin for help."),
+                                 kb(rows([btn("😘 Message admin", "contact_admin")])))
 
         state = get_state(tg_id)
         if state and self.step_is_optional(state, text):
@@ -1483,7 +1785,7 @@ class PremiumBot:
             return self.on_command(chat_id, tg_id, uid, m, text, media, admin)
         if text:
             return self.show_store(chat_id, uid, search=text)
-        self.bot.send(chat_id, "Tap a button below to continue 👇", kb(self.home_kb(uid)))
+        self.bot.send(chat_id, upe("😄 Tap a button below to continue"), kb(self.home_kb(uid)))
 
     def on_callback(self, cb: dict):
         m = cb.get("message") or {}
@@ -1494,11 +1796,12 @@ class PremiumBot:
         admin = tg_id in ADMIN_IDS
         urow = user_by_tg(tg_id) or {"id": ensure_user(frm), "tg_id": tg_id, "name": frm.get("first_name", "User")}
         uid = urow["id"]
-        if not admin and is_blocked(tg_id):
+        # the user row we just fetched already carries the blocked flag — no 2nd query
+        if not admin and (urow.get("blocked") or is_blocked(tg_id)):
             return self.bot.answer(cb.get("id"), "Your access is suspended.", True)
+        self.bot.answer(cb.get("id"))          # ack the tap first — no spinner while we check
         if not admin and not self.channel_ok(tg_id, chat_id):
-            return self.bot.answer(cb.get("id"))
-        self.bot.answer(cb.get("id"))
+            return
         try:
             self.dispatch(chat_id, tg_id, uid, admin, data)
         except Exception:
@@ -1530,23 +1833,23 @@ class PremiumBot:
                                          [btn("🧾 Order status", "orders"), btn("💳 Payment info", "payinfo")])))
         if cmd == "/id":
             return self.bot.send(chat_id,
-                                 f"🆔 <b>Your details</b>\n{SEP}\nBot ID: <code>{uid}</code>\n"
-                                 f"Telegram ID: <code>{tg_id}</code>",
-                                 kb(rows([btn("🏠 Home", "home")])))
+                                 upe(f"🌸 <b>Your details</b>\n{SEP}\nBot ID: <code>{uid}</code>\n"
+                                     f"Telegram ID: <code>{tg_id}</code>"),
+                                 kb(rows([btn("🌸 Home", "home")])))
         if cmd == "/cancel":
             set_state(tg_id, {})
-            return self.bot.send(chat_id, "Cancelled — nothing was changed.",
-                                 kb(rows([btn("🛍 Browse store", "shop:0")])))
+            return self.bot.send(chat_id, upe("😄 Cancelled — nothing was changed."),
+                                 kb(rows([btn("🍑 Browse store", "shop:0")])))
         if cmd == "/unstick":
             target = re.sub(r"\D", "", arg) or str(tg_id)
             STORE.state_del(int(target))
-            msg = "Your pending step was reset." if not admin else f"Reset the pending step of <code>{target}</code>."
-            return self.bot.send(chat_id, msg, kb(rows([btn("🏠 Home", "home")])))
+            msg = upe("💦 Your pending step was reset.") if not admin else f"Reset the pending step of <code>{target}</code>."
+            return self.bot.send(chat_id, msg, kb(rows([btn("🌸 Home", "home")])))
 
         # ------------------------- admin commands -------------------------
         if not admin:
-            return self.bot.send(chat_id, "🔒 That command is for the administrator.",
-                                 kb(rows([btn("🛍 Browse store", "shop:0"), btn("📚 My library", "library")])))
+            return self.bot.send(chat_id, upe("🥵 That command is for the administrator."),
+                                 kb(rows([btn("🍑 Browse store", "shop:0"), btn("🍒 My library", "library")])))
         if cmd == "/admin":
             return self.admin_panel(chat_id)
         if cmd == "/additem":
@@ -1625,46 +1928,49 @@ class PremiumBot:
             joined = joined or str(rj)
             month = month or str(rm)
             today = today or str(rt)
-        return (f"👥 <b>{esc(joined)}</b> users already joined\n"
-                f"🔥 <b>{esc(month)}</b> active this month · ⚡ <b>{esc(today)}</b> active today")
+        return (f"🍑 <b>{esc(joined)}</b> users already joined\n"
+                f"🥵 <b>{esc(month)}</b> active this month · 💦 <b>{esc(today)}</b> active today")
 
     def support_line(self) -> str:
         s = all_settings()
         sup = (s["support_link"] or "").strip()
         if not sup:
-            return "🛠 <b>TECH SUPPORT</b> – tap <i>😘 Support</i> below"
+            return "😘 <b>TECH SUPPORT</b> – tap <i>😘 Support</i> below"
         if sup.startswith("@"):
-            return f"🛠 <b>TECH SUPPORT</b> – <a href=\"{t_url(sup)}\">{esc(sup)}</a>"
-        return f"🛠 <b>TECH SUPPORT</b> – <a href=\"{t_url(sup)}\">{esc(shorten(sup, 32))}</a>"
+            return f"😘 <b>TECH SUPPORT</b> – <a href=\"{t_url(sup)}\">{esc(sup)}</a>"
+        return f"😘 <b>TECH SUPPORT</b> – <a href=\"{t_url(sup)}\">{esc(shorten(sup, 32))}</a>"
 
     def default_welcome(self) -> str:
         s = all_settings()
         lowest = STORE.item_min_active_price()
-        lines = [f"🏆 <b><u>{esc(s['brand'])}</u></b>",
+        lines = [f"🥵 <b><u>{esc(s['brand'])}</u></b>",
                  "",
-                 "<blockquote>👋 <b>Welcome!</b> Premium videos, courses & VIP access —\n"
-                 "delivered <b>instantly</b> after payment verification. 🔐</blockquote>",
+                 "<blockquote>😄 <b>Welcome!</b> Premium videos, courses & VIP access —\n"
+                 "delivered <b>instantly</b> after payment verification. 💦</blockquote>",
                  "",
-                 "✨ <b>Why buy from us?</b>",
-                 "⚡ Instant delivery after approval",
-                 "🔒 100% safe & trusted payments",
-                 "💎 Premium quality content",
-                 "🎁 New free drops every week",
+                 "💦 <b>Why buy from us?</b>",
+                 "🥵 Instant delivery after approval",
+                 "💦 100% safe & trusted payments",
+                 "🍒 Premium quality content",
+                 "🍭 New free drops every week",
                  "",
-                 (f"💵 Plans start at <b>{money(lowest)}</b> — tap below & explore 👇"
+                 (f"🍆 Plans start at <b>{money(lowest)}</b> — tap below & explore 💦"
                   if lowest is not None else
-                  "🛍 Fresh content is added regularly — tap below & explore 👇")]
+                  "🍑 Fresh content is added regularly — tap below & explore 💦")]
         return pe("\n".join(lines))
 
     def welcome_body(self) -> str:
         """Custom welcome text (if any) + the always-on support & stats footer."""
         s = all_settings()
-        body = s["welcome_text"] or self.default_welcome()
+        # the admin's own text is left exactly as written (only premium-emoji wrapped);
+        # the built-in template goes through the curated customer emoji set
+        body = upe(s["welcome_text"]) if (s["welcome_text"] or "").strip() else self.default_welcome()
         return f"{body}\n\n{self.support_line()}\n{self.stats_lines()}"
 
     def welcome_preview_text(self) -> str:
-        photo = "🖼 Welcome photo: <b>set</b> ✅" if setting("welcome_photo_id") else "🖼 Welcome photo: <i>not set</i>"
-        return f"{self.welcome_body()}\n\n{SEP}\n{photo}"
+        photo = ("🖼 Welcome photo: <b>set</b> ✅" if setting("welcome_photo_id")
+                 else "🖼 Welcome photo: <i>not set</i>")
+        return pe(f"{self.welcome_body()}\n\n{SEP}\n{photo}")
 
     def cmd_start(self, chat_id, tg_id, uid, m, text):
         deep = re.search(r"/start\s+(\S+)", text or "")
@@ -1690,40 +1996,51 @@ class PremiumBot:
         buttons = self.home_kb(uid)
         photo = s["welcome_photo_id"]
         if photo:
-            caption = body if len(body) <= 1000 else body[:997] + "…"
+            caption = clip_visible(body, 1000)
             r = self.bot.send_media(chat_id, "photo", photo, caption=caption, kbd=buttons)
             if r and r.get("ok"):
-                if len(body) > 1000:
+                if text_len(body) > 1000:
                     self.bot.send(chat_id, body, kbd=buttons)
                 return
         self.bot.send(chat_id, body, kbd=buttons)
 
     def channel_ok(self, tg_id, chat_id, admin_ok=False) -> bool:
-        """If `force_channel` is set, the user must join that channel first."""
+        """If `force_channel` is set, the user must join that channel first.
+        The answer is cached for a couple of minutes — asking Telegram on every single
+        button press added a full network round trip to every tap."""
         ch = setting("force_channel").strip()
         if not ch or (admin_ok and tg_id in ADMIN_IDS):
             return True
-        try:
-            j = self.bot.api("getChatMember", {"chat_id": ch, "user_id": tg_id})
-            if ((j or {}).get("result") or {}).get("status") in ("creator", "administrator", "member", "restricted"):
+        key = f"{ch}|{tg_id}"
+        hit = self._member_cache.get(key)
+        if hit and time.time() - hit[0] < self.MEMBER_TTL:
+            if hit[1]:
                 return True
-        except Exception:
-            return True
+        else:
+            try:
+                j = self.bot.api("getChatMember", {"chat_id": ch, "user_id": tg_id})
+                ok = ((j or {}).get("result") or {}).get("status") in ("creator", "administrator",
+                                                                       "member", "restricted")
+                self._member_cache[key] = (time.time(), ok)
+                if ok:
+                    return True
+            except Exception:
+                return True
         url = ch if ch.startswith("http") else "https://t.me/" + ch.lstrip("@")
         self.bot.send(chat_id,
-                      pe(f"🔒 <b>Membership required</b>\n{SEP}\n"
-                         f"Join <b>{esc(ch)}</b> to use this bot, then tap the button below."),
+                      upe(f"🥵 <b>Membership required</b>\n{SEP}\n"
+                          f"Join <b>{esc(ch)}</b> to use this bot, then tap the button below."),
                       kb(rows([ubtn("Join channel", None, url, icon="👅", style="success")],
                               [ubtn("I joined — check again", "recheck", icon="🍑", style="primary")])))
         return False
 
     def help_text(self) -> str:
         s = all_settings()
-        return pe(f"😄 <b>{esc(s['brand'])} — help</b>\n{SEP}\n"
-                  "🍑 <b>Browse store</b> — all items with prices\n"
-                  "🍒 <b>My library</b> — everything you unlocked\n"
-                  "🧾 <b>My orders</b> — status of each payment\n"
-                  "💦 <b>Payment info</b> — QR / UPI id\n\n"
+        return upe(f"😄 <b>{esc(s['brand'])} — help</b>\n{SEP}\n"
+                   "🍑 <b>Browse store</b> — all items with prices\n"
+                   "🍒 <b>My library</b> — everything you unlocked\n"
+                   "🍒 <b>My orders</b> — status of each payment\n"
+                   "💦 <b>Payment info</b> — QR / UPI id\n\n"
                   f"<b>How buying works</b>\n{SEP}\n"
                   f"{esc(s['pay_note'])}\n\n"
                   f"<b>Refunds</b>\n{esc(s['refund_note'])}")
@@ -1743,20 +2060,20 @@ class PremiumBot:
             includes.append("private channel")
         if it["group_link"]:
             includes.append("private group")
-        access = "<i>Lifetime</i> ♾" if not it["validity_days"] else f"<i>{it['validity_days']} days</i>"
+        access = "<i>Lifetime</i> 💦" if not it["validity_days"] else f"<i>{it['validity_days']} days</i>"
         out = [f"{icon} <b><u>{esc(it['title'])}</u></b>  <i>#{it['id']}</i>",
                "",
-               f"💵 Price: <code>{money(it['price'])}</code>" if it["price"] > 0 else "💵 Price:  <b>Free</b>",
-               f"⏱ Access: {access}",
-               f"📦 Includes: {', '.join(includes)}" if includes else "📦 Includes: <i>—</i>",
-               f"🛒 Sold: <b>{it['sold']}</b>" if it["sold"] else ""]
+               f"🍑 Price: <code>{money(it['price'])}</code>" if it["price"] > 0 else "🍑 Price:  <b>Free</b>",
+               f"🍭 Access: {access}",
+               f"🍆 Includes: {', '.join(includes)}" if includes else "🍆 Includes: <i>—</i>",
+               f"💦 Sold: <b>{it['sold']}</b>" if it["sold"] else ""]
         if it["descr"]:
             out += ["", f"<blockquote>{esc(it['descr'])[:1500]}</blockquote>"]
         if uid and has_access(uid, it["id"]):
-            out += ["", "✅ <b>Already unlocked</b> — open it from your <i>📚 library</i>."]
+            out += ["", "💦 <b>Already unlocked</b> — open it from your <i>🍒 library</i>."]
         elif it["price"] > 0:
             out += ["", f"<s>hidden fees</s> <b>none</b> — {esc(s['pay_note'])[:160]}"]
-        return "\n".join([l for l in out if l != ""])
+        return upe("\n".join([l for l in out if l != ""]))
 
     def show_store(self, chat_id, uid, page=0, search=""):
         allitems = STORE.items_active(search, 300)
@@ -1765,23 +2082,23 @@ class PremiumBot:
         page = max(0, min(int(page), pages - 1))
         chunk = allitems[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
         if not chunk:
-            msg = pe("🔍 Nothing matched that search." if search else
-                     f"🛒 The store is empty right now.\n{SEP}\n"
-                     f"{esc(setting('out_of_stock_note') or 'Please check back soon.')}")
+            msg = upe("🍑 Nothing matched that search." if search else
+                      f"🍑 The store is empty right now.\n{SEP}\n"
+                      f"{esc(setting('out_of_stock_note') or 'Please check back soon.')}")
             return self.bot.send(chat_id, msg, kb(rows([ubtn("Home", "home", icon="🍑", style="primary")])))
         # one button per item — "Title (₹price)" — premium icon per item type
         buttons = []
         kind_emoji = {"video": "🍆", "photo": "🍑", "file": "💦", "link": "👅", "text": "🍭"}
         for it in chunk:
-            mark = "✅ " if uid and has_access(uid, it["id"]) else ""
+            mark = "💦 " if uid and has_access(uid, it["id"]) else ""
             price = "Free" if it["price"] <= 0 else money(it["price"])
-            buttons.append([ubtn(f"{mark}{shorten(it['title'], 40)} ({price})", f"item:{it['id']}",
+            buttons.append([ubtn(ue(f"{mark}{shorten(it['title'], 40)} ({price})"), f"item:{it['id']}",
                                  icon=kind_emoji.get(it["kind"], "🍆"))])
         head = (f"🍑 <b><u>{esc(setting('brand'))}</u></b> — <b>Premium store</b>\n\n"
                 f"<blockquote>🥵 <b>{total}</b> item{'s' if total != 1 else ''} live — "
                 f"tap one to buy.\nPrices are <i>final</i>, delivery is <i>instant</i>. 💦</blockquote>")
         if search:
-            head += f"\n🔍 results for “{esc(search)}”"
+            head += f"\n🍑 results for “{esc(search)}”"
         nav = []
         if page > 0:
             nav.append(ubtn("Prev", f"shop:{page - 1}", icon="🍑", style="primary"))
@@ -1791,7 +2108,7 @@ class PremiumBot:
             buttons.append(nav)
         buttons.append([ubtn("Back", "home", icon="🌸", style="primary")])
         self.bot.send(chat_id,
-                      pe(head) + (f"\n\n<i>Page {page + 1}/{pages}</i>" if pages > 1 else ""),
+                      upe(head) + (f"\n\n<i>Page {page + 1}/{pages}</i>" if pages > 1 else ""),
                       kb(buttons))
 
     def show_item(self, chat_id, uid, it):
@@ -1805,7 +2122,7 @@ class PremiumBot:
         buttons.append([ubtn("Payment info", "payinfo", icon="💦", style="primary"),
                         ubtn("How to use", "howto", icon="😄", style="primary")])
         buttons.append([ubtn("Back", "shop:0", icon="🍑", style="primary")])
-        self.bot.send(chat_id, pe(self.item_caption(it, uid)), kb(buttons))
+        self.bot.send(chat_id, self.item_caption(it, uid), kb(buttons))
 
     # ======================================================================
     # CHECKOUT
@@ -1818,16 +2135,16 @@ class PremiumBot:
                 if it:
                     break
         if not it:
-            return self.bot.send(chat_id, "Which item? Tap one in the store 👇",
-                                 kb(rows([btn("🛍 Browse store", "shop:0")])))
+            return self.bot.send(chat_id, upe("🍑 Which item? Tap one in the store 👅"),
+                                 kb(rows([btn("🍑 Browse store", "shop:0")])))
         self.start_buy(chat_id, uid, it)
 
     def start_buy(self, chat_id, uid, it):
         if not it["active"]:
-            return self.bot.send(chat_id, pe("⏸️ This item is not on sale right now."),
+            return self.bot.send(chat_id, upe("🥵 This item is not on sale right now."),
                                  kb(rows([ubtn("Browse store", "shop:0", icon="🍑", style="primary")])))
         if has_access(uid, it["id"]):
-            return self.bot.send(chat_id, pe("🍒 You already have this item — open it from your library."),
+            return self.bot.send(chat_id, upe("🍒 You already have this item — open it from your library."),
                                  kb(rows([ubtn("My library", "library", icon="🍒", style="primary")],
                                          [ubtn("Browse store", "shop:0", icon="🍑", style="primary")])))
         pending = pending_for_user(uid)
@@ -1836,10 +2153,10 @@ class PremiumBot:
             o = same[0]
             self.set_proof_state(uid, o["id"], it["id"])
             return self.payment_screen(chat_id, uid, o, it,
-                                       note=pe(f"⏳ Order <b>#{o['no']}</b> is already waiting for your screenshot."))
+                                       note=upe(f"🍭 Order <b>#{o['no']}</b> is already waiting for your screenshot."))
         if it["price"] <= 0:
             grant_access(uid, it["id"], None, it["validity_days"])
-            self.bot.send(chat_id, pe("🍭 Free item unlocked — enjoy! 😘"), kbd=rows())
+            self.bot.send(chat_id, upe("🍭 Free item unlocked — enjoy! 😘"), kbd=rows())
             return self.deliver(uid, it, None)
         oid = create_order(uid, it)
         self.set_proof_state(uid, oid, it["id"])
@@ -1859,28 +2176,29 @@ class PremiumBot:
         if note:
             body += [note, ""]
         body += [f"🍆 Item: <i>{esc(shorten(it['title'], 40))}</i>",
-                 f"🧾 Order ID: <code>#{o_no}</code>", ""]
+                 f"🍒 Order ID: <code>#{o_no}</code>", ""]
         if s["upi_id"]:
             body.append(f"UPI ID: <code>{esc(s['upi_id'])}</code>")
             body.append(f"Payee: <b>{esc(s['payee_name'] or s['brand'])}</b>")
             body.append(f"<pre>TO   : {s['upi_id']}\nAMT  : {amount:.2f}\nNOTE : #{o_no}</pre>")
         else:
-            body.append("⚠️ The admin has not added a UPI ID yet — please message the admin.")
+            body.append("🥵 The admin has not added a UPI ID yet — please message the admin.")
         body.append(f"🥵 Amount: <b>{money(amount)}</b> <i>(exact)</i>")
         body += ["", f"<blockquote>{esc(s['pay_note'])}"
                  + (f"\n{esc(s['pay_instructions'])}" if s["pay_instructions"] else "") + "</blockquote>"]
-        text = pe("\n".join([l for l in body if l is not None]))
+        text = upe("\n".join([l for l in body if l is not None]))
         buttons = rows([ubtn("I paid — submit screenshot", f"ready:{order['id'] if order else 0}",
                              icon="💦", style="success")])
         qr = s["qr_file_id"]
         if qr:
-            self.bot.send_media(chat_id, "photo", qr, caption=text[:1000], kbd=buttons)
-            if len(text) > 1000:
-                self.bot.send(chat_id, text[1000:], kbd=None)
+            head, tail = split_visible(text, 1000)
+            self.bot.send_media(chat_id, "photo", qr, caption=head, kbd=buttons)
+            if tail:
+                self.bot.send(chat_id, tail, kbd=None)
             return
         png = make_upi_qr(amount, o_no, s["upi_id"], s["payee_name"], f"#{o_no}")
         if png:
-            self.bot.send_upload(chat_id, png, caption=text[:1000], kind="photo")
+            self.bot.send_upload(chat_id, png, caption=clip_visible(text, 1000), kind="photo")
             try:
                 os.remove(png)
             except Exception:
@@ -1897,12 +2215,12 @@ class PremiumBot:
             return self.payment_screen(chat_id, uid, o, it)
         body = ["💦 <b><u>Payment details</u></b>",
                 "",
-                f"UPI ID: <code>{esc(s['upi_id'] or 'not configured')}</code>",
-                f"Payee: <b>{esc(s['payee_name'] or s['brand'])}</b>",
-                f"QR image: {'✅ on the checkout screen' if s['qr_file_id'] or s['upi_id'] else '❌ not set'}",
+                f"🍆 UPI ID: <code>{esc(s['upi_id'] or 'not configured')}</code>",
+                f"🌸 Payee: <b>{esc(s['payee_name'] or s['brand'])}</b>",
+                f"👅 QR image: {'💦 on the checkout screen' if s['qr_file_id'] or s['upi_id'] else '🥵 not set'}",
                 "",
                 f"<blockquote>{esc(s['pay_note'])}\n\n<i>{esc(s['refund_note'])}</i></blockquote>"]
-        self.bot.send(chat_id, pe("\n".join(body)),
+        self.bot.send(chat_id, upe("\n".join(body)),
                       kb(rows([ubtn("Buy Premium Videos", "shop:0", icon="🍆", style="success")],
                               [ubtn("Back", "home", icon="🌸", style="primary")])))
 
@@ -1913,16 +2231,16 @@ class PremiumBot:
         row = user_by_id(uid)
         u = dict(row) if row else {}
         lib = STORE.count_unlocks(uid)
-        body = ["🌸 <b><u>My profile</u></b>",
+        body = ["🥵 <b><u>My profile</u></b>",
                 "",
-                f"🆔 Bot ID: <code>{uid}</code> · TG: <code>{esc(str(u.get('tg_id', '')))}</code>",
-                f"🧾 Orders: <b>{u.get('orders', 0)}</b> · 💸 Spent: <code>{money(u.get('spent', 0))}</code>",
-                f"🍒 Library: <b>{lib}</b> item{'s' if lib != 1 else ''}",
-                f"🗓 Joined: <i>{ts(u.get('created_at', ''))}</i>",
+                f"🌸 Bot ID: <code>{uid}</code> · TG: <code>{esc(str(u.get('tg_id', '')))}</code>",
+                f"🍒 Orders: <b>{u.get('orders', 0)}</b> · 💦 Spent: <code>{money(u.get('spent', 0))}</code>",
+                f"🍆 Library: <b>{lib}</b> item{'s' if lib != 1 else ''}",
+                f"🍭 Joined: <i>{ts(u.get('created_at', ''))}</i>",
                 "",
                 f"<blockquote>{esc(u.get('name', ''))} {esc(u.get('username', ''))}\n"
                 f"<i>Status:</i> {'🥵 valued customer' if (u.get('spent') or 0) > 0 else '🍭 new member'}</blockquote>"]
-        self.bot.send(chat_id, pe("\n".join(body)),
+        self.bot.send(chat_id, upe("\n".join(body)),
                       kb(rows([ubtn("My library", "library", icon="🍒", style="primary"),
                                ubtn("My orders", "orders", icon="💦", style="primary")],
                               [ubtn("Payment info", "payinfo", icon="💦", style="primary")],
@@ -1933,18 +2251,18 @@ class PremiumBot:
         upi = f"<code>{esc(s['upi_id'])}</code>" if s["upi_id"] else "<i>shown at checkout</i>"
         body = ["😄 <b><u>How to use</u></b>",
                 "",
-                "<b>1️⃣ Pick a video</b> — tap <i>Buy Premium Videos</i> and choose one.",
-                f"<b>2️⃣ Pay the exact amount</b> — UPI {upi} or scan the QR.",
-                "<b>3️⃣ Send the screenshot</b> — 📸 photo of the successful payment.",
-                "<b>4️⃣ Get it instantly</b> — admin approves → content lands in your <i>🍒 library</i>.",
+                "<b>1.</b> Pick a video — tap <i>Buy Premium Videos</i> and choose one.",
+                f"<b>2.</b> Pay the exact amount — UPI {upi} or scan the QR.",
+                "<b>3.</b> Send the screenshot — 🥵 photo of the successful payment.",
+                "<b>4.</b> Get it instantly — admin approves — content lands in your <i>🍒 library</i>.",
                 "",
-                "<blockquote>⚠️ Send the <i>exact</i> amount. Wrong / short payments are "
+                "<blockquote>🥵 Send the <i>exact</i> amount. Wrong / short payments are "
                 f"<s>kept</s> <b>refunded</b> — {esc(s['refund_note'])[:140]}</blockquote>",
                 "",
-                "🤫 <tg-spoiler>free items unlock instantly — no payment needed</tg-spoiler>",
+                "😄 <tg-spoiler>free items unlock instantly — no payment needed</tg-spoiler>",
                 f"💦 Preview quality first in the <i>Free demo</i> channel."
                 if s["demo_link"] else ""]
-        self.bot.send(chat_id, pe("\n".join([l for l in body if l != ""])),
+        self.bot.send(chat_id, upe("\n".join([l for l in body if l != ""])),
                       kb(rows([ubtn("Buy Premium Videos", "shop:0", icon="🍆", style="success"),
                                ubtn("Payment info", "payinfo", icon="💦", style="primary")],
                               [ubtn("Back", "home", icon="🌸", style="primary")])))
@@ -1956,18 +2274,18 @@ class PremiumBot:
                 "<blockquote>Problem with a payment or a video?\n"
                 "Message the admin directly — you'll get a reply in this chat.</blockquote>"]
         if s["support_link"]:
-            body.append(f"🛠 <b>TECH SUPPORT</b> – <a href=\"{t_url(s['support_link'])}\">"
+            body.append(f"😘 <b>TECH SUPPORT</b> – <a href=\"{t_url(s['support_link'])}\">"
                         f"{esc(s['support_link'])}</a>")
-        self.bot.send(chat_id, pe("\n".join(body)),
+        self.bot.send(chat_id, upe("\n".join(body)),
                       kb(rows([ubtn("Message admin", "contact_admin", icon="😘", style="primary")],
                               [ubtn("Back", "home", icon="🌸", style="primary")])))
 
     def submit_proof(self, chat_id, tg_id, uid, order, media, note=""):
         if not media:
             return self.bot.send(chat_id,
-                                 pe("📸 Please send the actual <b>screenshot</b> of the payment "
-                                    "(photo or file) — a text message can't be verified."),
-                                 kb(rows([btn("❌ Cancel order", f"cancel:{order['id']}", style="danger")])))
+                                 upe("🥵 Please send the actual <b>screenshot</b> of the payment "
+                                     "(photo or file) — a text message can't be verified."),
+                                 kb(rows([btn("🥵 Cancel order", f"cancel:{order['id']}", style="danger")])))
         STORE.order_update(int(order["id"]), proof_id=media["file_id"],
                            proof_kind=media["file_kind"], note=(note or "")[:200])
         set_state(tg_id, {})
@@ -1975,9 +2293,9 @@ class PremiumBot:
         it = get_item(order["item_id"])
         urow = user_by_id(uid)
         self.bot.send(chat_id,
-                      pe(f"💦 <b>Proof received</b>\n{SEP}\nOrder <b>#{order['no']}</b> · {money(order['amount'])}\n"
-                         "Status: <b>waiting for admin approval</b>\n"
-                         "You'll get the content the moment it is approved — usually 5–30 minutes. 😘"),
+                      upe(f"💦 <b>Proof received</b>\n{SEP}\nOrder <b>#{order['no']}</b> · {money(order['amount'])}\n"
+                          "Status: <b>waiting for admin approval</b>\n"
+                          "You'll get the content the moment it is approved — usually 5–30 minutes. 😘"),
                       kb(rows([ubtn("Check status", "orders", icon="💦", style="primary"),
                                ubtn("Keep browsing", "shop:0", icon="🍑", style="primary")])))
         self.notify_admin(order, it, urow)
@@ -1986,12 +2304,13 @@ class PremiumBot:
     def cancel_order(self, chat_id, uid, oid):
         o = get_order(oid)
         if not o or int(o["user_id"]) != int(uid):
-            return self.bot.send(chat_id, "❌ Order not found.")
+            return self.bot.send(chat_id, "🥵 Order not found.")
         if o["status"] != "pending":
-            return self.bot.send(chat_id, f"Order #{o['no']} is already <b>{o['status']}</b> — nothing to cancel.")
+            return self.bot.send(chat_id, upe(f"Order <b>#{o['no']}</b> is already <b>{o['status']}</b> "
+                                              "— nothing to cancel."))
         STORE.order_update(int(oid), status="cancelled", decided_at=now())
         set_state(int(self.tg_of(uid) or 0), {})
-        self.bot.send(chat_id, pe(f"🗑 Order <b>#{o['no']}</b> was cancelled."),
+        self.bot.send(chat_id, upe(f"🥵 Order <b>#{o['no']}</b> was cancelled."),
                       kb(rows([ubtn("Browse store", "shop:0", icon="🍑", style="primary")],
                               [ubtn("My orders", "orders", icon="💦", style="primary")])))
         for a in ADMIN_IDS:
@@ -2004,43 +2323,44 @@ class PremiumBot:
         rows_ = STORE.library_rows(uid, 40)
         if not rows_:
             return self.bot.send(chat_id,
-                                 pe("🍒 <b>Your library is empty</b>\n" + SEP + "\n"
-                                    "Items you buy appear here and stay available forever."),
+                                 upe("🍒 <b>Your library is empty</b>\n" + SEP + "\n"
+                                     "Items you buy appear here and stay available forever."),
                                  kb(rows([ubtn("Browse store", "shop:0", icon="🍑", style="success")],
                                          [ubtn("Payment info", "payinfo", icon="💦", style="primary")])))
         lines, buttons = [], []
         for r in rows_:
             exp = f" · expires {ts(r['expires_at'])}" if r["expires_at"] else ""
-            lines.append(f"▪️ <b>#{r['item_id']}</b> {esc(shorten(r['title'], 38))}{exp}")
+            lines.append(f"🍒 <b>#{r['item_id']}</b> {esc(shorten(r['title'], 38))}{exp}")
             buttons.append([ubtn(f"Open {shorten(r['title'], 26)}", f"open:{r['item_id']}",
                                  icon="🍒", style="primary")])
         buttons.append([ubtn("Browse more", "shop:0", icon="🍑", style="success"),
                         ubtn("My orders", "orders", icon="💦", style="primary")])
-        self.bot.send(chat_id, pe(f"🍒 <b>My library</b> — {len(rows_)} item(s)\n{SEP}\n\n" + "\n".join(lines)),
+        self.bot.send(chat_id, upe(f"🍒 <b>My library</b> — {len(rows_)} item(s)\n{SEP}\n\n" + "\n".join(lines)),
                       kb(buttons))
 
     def show_orders(self, chat_id, uid):
         rows_ = STORE.orders_for_user(uid, 10)
         if not rows_:
             return self.bot.send(chat_id,
-                                 pe("🧾 <b>No orders yet</b>\n" + SEP + "\nPick an item and pay — the order will show here."),
+                                 upe("🍒 <b>No orders yet</b>\n" + SEP + "\n"
+                                     "Pick an item and pay — the order will show here."),
                                  kb(rows([ubtn("Browse store", "shop:0", icon="🍑", style="success")])))
-        icon = {"pending": "⏳", "approved": "✅", "declined": "❌", "cancelled": "🗑"}
+        icon = {"pending": "🍭", "approved": "💦", "declined": "🥵", "cancelled": "🥵"}
         lines, buttons = [], []
         for r in rows_:
-            line = (f"{icon.get(r['status'], '•')} <b>#{r['no']}</b> · {esc(shorten(r['title'], 26))} · "
+            line = (f"{icon.get(r['status'], '🍭')} <b>#{r['no']}</b> · {esc(shorten(r['title'], 26))} · "
                     f"{money(r['amount'])}\n   <b>{r['status'].upper()}</b> · {ts(r['created_at'])}")
             if r["reason"]:
-                line += f"\n   ↳ {esc(r['reason'])[:120]}"
+                line += f"\n   · {esc(r['reason'])[:120]}"
             lines.append(line)
             if r["status"] == "pending":
                 buttons.append([ubtn(f"Send proof · #{r['no']}", f"ready:{r['id']}", icon="💦", style="success"),
-                                btn(f"❌ Cancel · #{r['no']}", f"cancel:{r['id']}", style="danger")])
+                                btn(f"🥵 Cancel · #{r['no']}", f"cancel:{r['id']}", style="danger")])
             else:
                 buttons.append([ubtn(f"Open item · #{r['no']}", f"open:{r['item_id']}", icon="🍒", style="primary")])
         buttons.append([ubtn("My library", "library", icon="🍒", style="primary"),
                         ubtn("Browse store", "shop:0", icon="🍑", style="success")])
-        self.bot.send(chat_id, pe(f"🧾 <b>My orders</b>\n{SEP}\n\n" + "\n".join(lines)), kb(buttons))
+        self.bot.send(chat_id, upe(f"🍒 <b>My orders</b>\n{SEP}\n\n" + "\n".join(lines)), kb(buttons))
 
     # ======================================================================
     # DELIVERY
@@ -2061,56 +2381,57 @@ class PremiumBot:
 
         # ---- access line ----
         if not it["validity_days"]:
-            access = "♾️ Access: <b>Lifetime</b>"
+            access = "💦 Access: <b>Lifetime</b>"
         else:
             exp = (datetime.now() + timedelta(days=int(it["validity_days"]))).strftime("%d %b %Y")
-            access = f"⏱ Access: <b>{it['validity_days']} days</b> (valid till {exp})"
+            access = f"🍭 Access: <b>{it['validity_days']} days</b> (valid till {exp})"
 
         # ---- receipt card ----
         if o and float(o["amount"] or 0) > 0:
-            headline = "✅ <b>PURCHASE SUCCESSFUL</b> 🎉"
-            pay_line = f"💰 You paid: <b>{money(o['amount'])}</b>"
-            order_line = f"🧾 Order ID: <b>#{o['no']}</b> · {ts(o['decided_at'] or o['created_at'])}"
+            headline = "🥵 <b>PURCHASE SUCCESSFUL</b> 💦"
+            pay_line = f"💦 You paid: <b>{money(o['amount'])}</b>"
+            order_line = f"🍒 Order ID: <b>#{o['no']}</b> · {ts(o['decided_at'] or o['created_at'])}"
             price_tag = f" · {money(o['amount'])}"
         else:
-            headline = "🎁 <b>ACCESS UNLOCKED</b> ✨"
-            pay_line = "💰 Price: <b>FREE</b>"
-            order_line = f"🧾 Unlocked: {ts((o or {}).get('decided_at') or (o or {}).get('created_at') or now())}"
+            headline = "🍭 <b>ACCESS UNLOCKED</b> 💦"
+            pay_line = "💦 Price: <b>FREE</b>"
+            order_line = f"🍒 Unlocked: {ts((o or {}).get('decided_at') or (o or {}).get('created_at') or now())}"
             price_tag = " · FREE"
 
         body = [headline, SEP,
-                f"🎬 <b>{esc(it['title'])}</b>", "",
+                f"🍆 <b>{esc(it['title'])}</b>", "",
                 pay_line, order_line, access, SEP]
         # admin's description — shown only when the admin actually wrote one
         if (it["descr"] or "").strip():
-            body += ["📝 <b>Description</b>", f"<blockquote>{esc(it['descr'])[:900]}</blockquote>", ""]
-        # links — clickable right here in the chat AND as buttons below
+            body += ["🍭 <b>Description</b>", f"<blockquote>{esc(it['descr'])[:900]}</blockquote>", ""]
+        # links — the full link is written out in plain text (no hidden "Join channel"
+        # anchor); the buttons under the message are the one-tap way in
         link_lines = []
         if it["link"]:
-            link_lines.append(f"🔗 Main link: <a href=\"{t_url(it['link'])}\">{esc(shorten(it['link'], 40))}</a>")
+            link_lines.append(f"👅 <b>Main link:</b> {esc(it['link'])}")
         if it["channel_link"]:
-            link_lines.append(f"📢 Channel: <a href=\"{t_url(it['channel_link'])}\">Join channel</a>")
+            link_lines.append(f"👅 <b>Channel:</b> {esc(it['channel_link'])}")
         if it["group_link"]:
-            link_lines.append(f"👥 Group: <a href=\"{t_url(it['group_link'])}\">Join group</a>")
+            link_lines.append(f"👅 <b>Group:</b> {esc(it['group_link'])}")
         if link_lines:
             body += link_lines + [""]
-        body += [f"🙏 Thank you for shopping with <b>{esc(s['brand'])}</b>!",
-                 "Your content is ready — enjoy 👇"]
-        head = pe("\n".join(body))
+        body += [f"😘 Thank you for shopping with <b>{esc(s['brand'])}</b>!",
+                 "Your content is ready — enjoy 💦"]
+        head = upe("\n".join(body))
 
         links = []
         if it["link"]:
-            links.append(ubtn(f"Open link{price_tag}", None, it["link"], icon="⬇️", style="success"))
+            links.append(ubtn(f"Open link{price_tag}", None, it["link"], icon="👅", style="success"))
         if it["channel_link"]:
-            links.append(ubtn(f"Join channel{price_tag}", None, it["channel_link"], icon="⬇️", style="success"))
+            links.append(ubtn(f"Join channel{price_tag}", None, it["channel_link"], icon="👅", style="success"))
         if it["group_link"]:
-            links.append(ubtn(f"Join group{price_tag}", None, it["group_link"], icon="⬇️", style="success"))
+            links.append(ubtn(f"Join group{price_tag}", None, it["group_link"], icon="👅", style="success"))
         link_rows = [links[i:i + 2] for i in range(0, len(links), 2)]
         footer = rows([ubtn("My library", "library", icon="🍒", style="primary"),
                        ubtn("Buy something else", "shop:0", icon="🍆", style="success")])
         if it["file_id"]:
             r = self.bot.send_media(chat, it["file_kind"] or it["kind"], it["file_id"],
-                                    caption=head + "\n\n📦 <i>Your file is attached to this message.</i>",
+                                    caption=head + "\n\n🍆 <i>Your file is attached to this message.</i>",
                                     kbd=link_rows + footer)
             if r and not r.get("ok") and not self.bot.offline:
                 for a in ADMIN_IDS:
@@ -2186,12 +2507,12 @@ class PremiumBot:
         if urow:
             set_state(int(urow["tg_id"]), {})
             self.bot.send(int(urow["tg_id"]),
-                          pe(f"❌ <b>Order #{o['no']} was not approved</b>\n{SEP}\n"
-                             f"📝 Reason: {esc(reason)}\n\n"
-                             "You can send the correct proof or order again."),
-                          kb(rows([btn("📤 Re-send screenshot", f"ready:{o['id']}", style="success"),
-                                    btn("🛍 Try again", f"buy:{o['item_id']}", style="primary")],
-                                  [btn("💬 Message admin", "contact_admin", style="primary")])))
+                          upe(f"🥵 <b>Order #{o['no']} was not approved</b>\n{SEP}\n"
+                              f"🍭 Reason: {esc(reason)}\n\n"
+                              "You can send the correct proof or order again."),
+                          kb(rows([btn("💦 Re-send screenshot", f"ready:{o['id']}", style="success"),
+                                   btn("🍑 Try again", f"buy:{o['item_id']}", style="primary")],
+                                  [btn("😘 Message admin", "contact_admin", style="primary")])))
         self.bot.send(admin_chat,
                       f"❌ <b>Declined #{o['no']}</b>\n{SEP}\n{esc(o['note'] or '')}\nReason sent to the user.",
                       kb(rows([ubtn("Pending queue", "pend", icon="🔋", style="primary")],
@@ -2791,7 +3112,7 @@ class PremiumBot:
             return self.bot.answer(cb_id=None, text="Still not a member", alert=True)
         if data == "contact_admin":
             set_state(tg_id, {"flow": "toadmin", "step": "text", "d": {}})
-            return self.bot.send(chat_id, "✍️ Type your message — it will be delivered to the admin.")
+            return self.bot.send(chat_id, upe("😘 Type your message — it will be delivered to the admin."))
         if data == "profile":
             return self.show_profile(chat_id, uid)
         if data == "howto":
@@ -2803,7 +3124,7 @@ class PremiumBot:
         if data.startswith("item:"):
             it = get_item(int(data[5:]))
             if not it:
-                return self.bot.send(chat_id, "That item no longer exists.")
+                return self.bot.send(chat_id, upe("🥵 That item no longer exists."))
             if uid and has_access(uid, it["id"]):
                 return self.open_item(chat_id, uid, it["id"])
             if admin or tg_id in ADMIN_IDS:
@@ -2811,29 +3132,31 @@ class PremiumBot:
             return self.start_buy(chat_id, uid, it)          # buyers go straight to checkout
         if data.startswith("buy:"):
             it = get_item(int(data[4:]))
-            return self.start_buy(chat_id, uid, it) if it else self.bot.send(chat_id, "That item no longer exists.")
+            return self.start_buy(chat_id, uid, it) if it else self.bot.send(chat_id, upe("🥵 That item no longer exists."))
         if data.startswith("open:"):
             return self.open_item(chat_id, uid, int(data[5:]))
         if data.startswith("ready:"):
             oid = int(data[6:])
             o = get_order(oid)
             if not o:
-                return self.bot.send(chat_id, "❌ Order not found.", kb(rows([ubtn("My orders", "orders", icon="💦", style="primary")])))
+                return self.bot.send(chat_id, "🥵 Order not found.",
+                                     kb(rows([ubtn("My orders", "orders", icon="🍒", style="primary")])))
             self.set_proof_state(uid, oid, o["item_id"])
             return self.bot.send(chat_id,
-                                pe("📸 <b>Send the payment screenshot now</b> (photo or file).\n" + SEP +
-                                   "\nThe admin reviews it and unlocks your item right away. 😘"),
-                                kb(rows([btn("❌ Cancel order", f"cancel:{oid}", style="danger")])))
+                                 upe("🥵 <b>Send the payment screenshot now</b> (photo or file).\n" + SEP +
+                                     "\nThe admin reviews it and unlocks your item right away. 😘"),
+                                 kb(rows([btn("🥵 Cancel order", f"cancel:{oid}", style="danger")])))
         if data.startswith("cancel:"):
             return self.cancel_order(chat_id, uid, int(data[7:]))
         if data == "cancel_flow":
             set_state(tg_id, {})
             return self.bot.send(chat_id, "Cancelled — nothing was changed.",
-                                 kb(rows([btn("🛠 Admin panel", "admin")] if admin else [btn("🏠 Home", "home")])))
+                                 kb(rows([btn("🛠 Admin panel", "admin")] if admin
+                                         else [btn("🌸 Home", "home")])))
 
         # ------------------------- admin -------------------------
         if not admin:
-            return self.bot.send(chat_id, "🔒 Admin only.", kb(rows([btn("🛍 Browse store", "shop:0")])))
+            return self.bot.send(chat_id, upe("🥵 Admin only."), kb(rows([btn("🍑 Browse store", "shop:0")])))
         if data == "admin":
             return self.admin_panel(chat_id)
         if data == "newitem":
@@ -3107,11 +3430,11 @@ class PremiumBot:
     def open_item(self, chat_id, uid, item_id):
         it = get_item(item_id)
         if not it:
-            return self.bot.send(chat_id, "❌ This item was removed by the admin.")
+            return self.bot.send(chat_id, upe("🥵 This item was removed by the admin."))
         if not has_access(uid, item_id):
-            return self.bot.send(chat_id, pe("🔒 This item is locked — complete the payment first."),
+            return self.bot.send(chat_id, upe("🥵 This item is locked — complete the payment first."),
                                  kb(rows([ubtn(f"Buy for {money(it['price'])}", f"buy:{item_id}", icon="💦", style="success"),
-                                          ubtn("My orders", "orders", icon="🧾", style="primary")])))
+                                          ubtn("My orders", "orders", icon="🍒", style="primary")])))
         return self.deliver(uid, it, None)
 
     OPTIONAL_STEPS = {"descr", "media", "links", "validity", "post_links", "post_validity",
@@ -3243,8 +3566,8 @@ class PremiumBot:
             if media or bare.lower() in ("done", "paid", "ok", "sent"):
                 return self.submit_proof(chat_id, tg_id, uid, o, media, low if media else "")
             self.bot.send(chat_id,
-                          "📸 Send the <b>screenshot</b> (photo or file) of your payment.\n" + SEP,
-                          kbd=rows([btn("💳 Payment info", "payinfo"), btn("❌ Cancel order", f"cancel:{o['id']}")]))
+                          upe("🥵 Send the <b>screenshot</b> (photo or file) of your payment.\n" + SEP),
+                          kbd=rows([btn("💦 Payment info", "payinfo"), btn("🥵 Cancel order", f"cancel:{o['id']}")]))
             return True
 
         # ---------------- user: message for the admin ----------------
@@ -3259,8 +3582,8 @@ class PremiumBot:
                 else:
                     self.bot.send(a, f"💬 <b>Message from customer</b>\n{SEP}\n{esc(text)[:1200]}",
                                   kbd=rows([btn("👤 Reply / profile", f"ausr:{uid}"), btn("🧾 Their orders", f"ausers:{uid}")]))
-            self.bot.send(chat_id, "✅ Sent to the admin. They usually reply within a few hours.",
-                          kbd=rows([btn("🏠 Home", "home")]))
+            self.bot.send(chat_id, upe("💦 Sent to the admin. They usually reply within a few hours."),
+                          kbd=rows([btn("🌸 Home", "home")]))
             return True
 
         # ---------------- admin: decline reason ----------------
@@ -3557,13 +3880,14 @@ class PremiumBot:
         if not (text or media):
             self.bot.send(chat_id, "❌ Nothing to send — type the message and try again.")
             return None
-        head = f"📣 <b>{esc(setting('brand'))}</b>\n{SEP}\n"
+        head = upe(f"📣 <b>{esc(setting('brand'))}</b>\n{SEP}\n")
         n = 0
         for tg in targets:
             if media:
-                self.bot.send_media(int(tg), media["file_kind"], media["file_id"], caption=head + esc(text)[:900])
+                self.bot.send_media(int(tg), media["file_kind"], media["file_id"],
+                                    caption=head + ue(esc(text))[:900])
             else:
-                self.bot.send(int(tg), head + esc(text)[:3000])
+                self.bot.send(int(tg), head + ue(esc(text))[:3000])
             n += 1
             time.sleep(0.05)
         return n
@@ -3593,7 +3917,8 @@ class PremiumBot:
         while True:
             try:
                 j = self.bot.api("getUpdates", {"offset": self.offset, "timeout": POLL_TIMEOUT,
-                                                "allowed_updates": ["message", "edited_message", "callback_query"]})
+                                                "allowed_updates": json.dumps(
+                                                    ["message", "edited_message", "callback_query"])})
                 if not j or not j.get("ok"):
                     fails += 1
                     time.sleep(min(30, 2 + fails * 3))
@@ -3989,8 +4314,9 @@ def selftest(mongo=False) -> int:
     check("delivery is a professional receipt", "PURCHASE SUCCESSFUL" in cap1 and "You paid" in cap1)
     check("delivery receipt shows paid amount", "₹199" in cap1)
     check("delivery shows order id + lifetime access", f"#{o1['no']}" in cap1 and "Lifetime" in cap1)
-    check("channel link clickable in the chat text",
-          "https://t.me/ravipremium" in cap1 and "Join channel" in cap1)
+    check("channel link shown as the plain link (no hidden anchor)",
+          "https://t.me/ravipremium" in cap1 and "<a href=\"https://t.me/ravipremium\">" not in cap1
+          and "Channel:" in cap1)
     check("delivery hides empty description", "Description" not in cap1)
     check("delivery has channel button with price",
           "Join channel" in json.dumps(out("sendVideo", 2)[0]["params"], ensure_ascii=False) and
@@ -4048,7 +4374,7 @@ def selftest(mongo=False) -> int:
     pb.handle_update(mk_cb(2, f"open:{items[0]['id']}"))
     r2 = out("sendVideo", 2)[0]["params"].get("caption", "") if out("sendVideo", 2) else ""
     check("re-delivery includes the admin description", "Description" in r2 and "resume template" in r2)
-    check("re-delivery keeps clickable channel link", "https://t.me/ravipremium" in r2)
+    check("re-delivery shows the channel link", "https://t.me/ravipremium" in r2)
     pb.handle_update(mk_cb(1, f"f:validity_days:{items[0]['id']}"))
     pb.handle_update(mk_cb(1, "wiz:validity0"))
     check("validity set to lifetime by button", int(get_item(items[0]["id"])["validity_days"]) == 0)
@@ -4116,6 +4442,77 @@ def selftest(mongo=False) -> int:
     pb.handle_update(mk_cb(1, "aall"))
     check("approve-all asks for confirmation", "Approve" in last_text("sendMessage", 1) and "Yes, approve" in
           json.dumps(out("sendMessage", 1)[-1]["params"]))
+
+    head("Premium emoji — customer set, admin coverage, cooldown")
+
+    def texts_to(chat=None):
+        """Every text + button markup sent to a chat (escaped quotes normalised)."""
+        out_ = []
+        for o in bot.outbox:
+            if chat is not None and str(o["params"].get("chat_id")) != str(chat):
+                continue
+            body = str(o["params"].get("text") or o["params"].get("caption") or "")
+            markup = str(o["params"].get("reply_markup") or "")
+            out_.append(body + "\n" + markup.replace('\\"', '"'))
+        return "\n".join(out_)
+
+    check("customer set = the ten animated emoji",
+          set(PEMOJI.get(e) for e in ["💦", "🍑", "🥵", "🍭", "🍆", "🍒", "🌸", "😘", "👅", "😄"]) ==
+          {v for v in USER_EMOJI_BASE.values()},
+          f"→ {len(USER_EMOJI_BASE)} emoji, {len(PEMOJI)} ids loaded from the folder")
+    check("a UserSide file would win over the admin files (same ids in the shop)",
+          PEMOJI["💦"] == USER_EMOJI_BASE["💦"] and PEMOJI["🌸"] == USER_EMOJI_BASE["🌸"])
+    check("upe() swaps unknown emoji for the curated set",
+          upe("✅ done 🎉") == pe("💦 done 💦") and ue("🧾 📢") == "🍒 👅")
+    check("upe() never double-wraps a message", upe(upe("💦 ok")) == upe("💦 ok"))
+    check("premium emoji are wrapped in <tg-emoji>", "<tg-emoji emoji-id=" in upe("💦 ok"))
+
+    bot.outbox.clear()
+    pb.handle_update(mk_msg(2, "/start"))
+    pb.handle_update(mk_cb(2, "shop:0"))
+    pb.handle_update(mk_cb(2, "howto"))
+    pb.handle_update(mk_cb(2, "profile"))
+    pb.handle_update(mk_cb(2, "orders"))
+    pb.handle_update(mk_cb(2, "payinfo"))
+    pb.handle_update(mk_cb(2, "library"))
+    pb.handle_update(mk_cb(2, "support"))
+    pb.handle_update(mk_cb(2, "help"))
+    customer_txt = texts_to(2)
+    stray = sorted({e for e in ANY_EMOJI_RE.findall(_TG_EMOJI_RE.sub(r"\1", customer_txt))
+                    if e.replace("\ufe0f", "") not in USER_EMOJI_BASE})
+    check("every emoji a customer sees comes from the curated set", not stray, f"→ stray: {stray}")
+    check("customer buttons carry premium icons + colours",
+          '"icon_custom_emoji_id"' in customer_txt and '"style"' in customer_txt)
+
+    set_setting("welcome_text", "🎉 Big sale 🎁 — tap below")
+    bot.outbox.clear()
+    pb.handle_update(mk_msg(4, "/start"))
+    w_txt = texts_to(4)
+    set_setting("welcome_text", "")
+    w_stray = sorted({e for e in ANY_EMOJI_RE.findall(_TG_EMOJI_RE.sub(r"\1", w_txt))
+                      if e.replace("\ufe0f", "") not in USER_EMOJI_BASE})
+    check("even a hand-typed welcome text arrives in the curated set", not w_stray, f"→ stray: {w_stray}")
+
+    admin_txt = texts_to(1)
+    no_id = sorted({e for e in ANY_EMOJI_RE.findall(_TG_EMOJI_RE.sub(r"\1", admin_txt))
+                    if e not in PEMOJI and e + "\ufe0f" not in PEMOJI})
+    check("no admin screen is left with a plain (non-premium) emoji", not no_id, f"→ missing ids: {no_id}")
+
+    premium_emoji_off("self-test")
+    check("a rejected custom emoji switches them off (no retry on every message)",
+          not premium_emoji_on() and pe("💦 ok") == "💦 ok")
+    globals()["_premium_off_until"] = 0.0
+    check("...and they come back automatically", premium_emoji_on() and "<tg-emoji" in pe("💦 ok"))
+
+    head("Caching — settings stay fresh, DB round trips stay low")
+    set_setting("brand", "Cached Brand")
+    check("a settings write invalidates the cache immediately", setting("brand") == "Cached Brand")
+    set_setting("brand", "Ravi Premium")
+    check("...and the next write is visible too", setting("brand") == "Ravi Premium")
+    grant_access(user_by_tg(4)["id"], items[0]["id"], None, 0)
+    check("a new unlock is visible at once", has_access(user_by_tg(4)["id"], items[0]["id"]))
+    STORE.unlock_delete(user_by_tg(4)["id"], items[0]["id"])
+    check("a revoked unlock is gone at once", not has_access(user_by_tg(4)["id"], items[0]["id"]))
 
     head("Customers, stats, broadcast, safety")
     pb.handle_update(mk_cb(1, "pg:users"))
